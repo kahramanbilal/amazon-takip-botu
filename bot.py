@@ -20,23 +20,29 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 TOKEN = os.environ.get("TELEGRAMTOKEN")
 CHAT_ID_ENV = os.environ.get("CHATID")
 
-# Güvenlik için Chat ID integer formatına dönüştürülür
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
-
-# Veri depolama dosyası
 DATA_FILE = "tracked_products.json"
 
-# Amazon Tarayıcı Başlıkları
+# Gelişmiş Tarayıcı Başlıkları (Amazon Bot Engeline Karşı)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1"
 }
 
-# ================= VERİ TABANI (JSON) YÖNETİMİ =================
+# ================= VERİ TABANI YÖNETİMİ =================
 
 def load_data() -> dict:
-    """Verileri JSON dosyasından yükler."""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -47,20 +53,17 @@ def load_data() -> dict:
     return {}
 
 def save_data(data: dict):
-    """Verileri JSON dosyasına kaydeder."""
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Veri kaydetme hatası: {e}")
 
-# Global hafıza
 tracked_products = load_data()
 
 # ================= YARDIMCI FONKSİYONLAR =================
 
 def parse_price(price_str: str) -> float:
-    """Metin halindeki fiyatı sayısal değere çevirir."""
     if not price_str:
         return 0.0
     try:
@@ -71,34 +74,51 @@ def parse_price(price_str: str) -> float:
         return 0.0
 
 def resolve_url(url: str) -> str:
-    """Kısa linkleri (amzn.eu) gerçek URL'e dönüştürür."""
     try:
-        res = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=10)
+        session = requests.Session()
+        res = session.head(url, headers=HEADERS, allow_redirects=True, timeout=10)
         return res.url
     except Exception:
         return url
 
 def scrape_amazon(url: str):
-    """Amazon sayfasından başlık, stok ve en düşük fiyatı tarar."""
     try:
+        session = requests.Session()
         full_url = resolve_url(url)
-        res = requests.get(full_url, headers=HEADERS, timeout=15)
+        res = session.get(full_url, headers=HEADERS, timeout=15)
+        
         if res.status_code != 200:
+            logging.warning(f"Amazon Yanıtı Sayfayı Engelledi! Status: {res.status_code}")
             return None
 
         soup = BeautifulSoup(res.text, "html.parser")
         page_text = res.text.lower()
 
+        # Bot Tespiti / Captcha Kontrolü
+        if "api-services-support@amazon.com" in page_text or "robot" in page_text:
+            logging.warning("Amazon CAPTCHA / Bot engeline takıldı.")
+            return None
+
         # Ürün Başlığı
         title_el = soup.find("span", {"id": "productTitle"})
         title = title_el.get_text(strip=True) if title_el else "Amazon Ürünü"
 
-        # Fiyat Analizi (Ana satıcı + Diğer satıcılar)
+        # Fiyat Analizi
         prices = []
-        main_price_el = soup.find("span", class_="a-offscreen")
-        if main_price_el:
-            prices.append(parse_price(main_price_el.get_text()))
+        
+        # 1. Yöntem: Ana Fiyat
+        price_span = soup.find("span", class_="a-price")
+        if price_span:
+            offscreen = price_span.find("span", class_="a-offscreen")
+            if offscreen:
+                prices.append(parse_price(offscreen.get_text()))
 
+        # 2. Yöntem: Apex / Core Price
+        core_price = soup.find("span", {"id": "priceblock_ourprice"}) or soup.find("span", {"id": "priceblock_dealprice"})
+        if core_price:
+            prices.append(parse_price(core_price.get_text()))
+
+        # 3. Yöntem: Diğer Satıcılar
         other_sellers_box = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
         if other_sellers_box:
             other_prices = other_sellers_box.find_all("span", class_="a-color-price")
@@ -108,11 +128,23 @@ def scrape_amazon(url: str):
         valid_prices = [p for p in prices if p > 0]
         lowest_price = min(valid_prices) if valid_prices else 0.0
 
-        # Stok Durumu
-        out_keywords = ["şu anda stokta yok", "geçici olarak temin edilememektedir", "currently unavailable"]
-        is_out_of_stock = any(kw in page_text for kw in out_keywords)
-        has_add_to_cart = soup.find("input", {"id": "add-to-cart-button"}) is not None
-        in_stock = not is_out_of_stock and (has_add_to_cart or lowest_price > 0)
+        # Stok Durumu Gelişmiş Kontrol
+        out_keywords = [
+            "şu anda stokta yok", 
+            "geçici olarak temin edilememektedir", 
+            "currently unavailable",
+            "bu ürün şu anda mevcut değil"
+        ]
+        
+        # Açıkça stokta yok yazıyor mu?
+        explicitly_out = any(kw in page_text for kw in out_keywords)
+        
+        # Sepete ekle / Hemen Al butonu veya fiyat var mı?
+        has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
+                         (soup.find("input", {"id": "buy-now-button"}) is not None) or \
+                         (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
+
+        in_stock = not explicitly_out and (has_add_to_cart or lowest_price > 0)
 
         return {
             "title": title[:40] + "..." if len(title) > 40 else title,
@@ -125,7 +157,6 @@ def scrape_amazon(url: str):
         return None
 
 def is_authorized(update: Update) -> bool:
-    """Yalnızca yetkili Chat ID'den gelen mesajlara izin verir."""
     if not ALLOWED_CHAT_ID:
         return True
     return update.effective_chat.id == ALLOWED_CHAT_ID
@@ -172,7 +203,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = scrape_amazon(url)
 
     if not data:
-        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Linki kontrol edin.")
+        await msg.edit_text("❌ Ürün bilgileri çekilemedi (Amazon korumasına takılmış olabilir). Lütfen tekrar deneyin.")
         return
 
     real_url = data["real_url"]
@@ -260,12 +291,9 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         notify = False
         alert_reason = ""
 
-        # 1. Stok Yokken Stoğa Girdi
         if curr_stock and not prev_stock:
             notify = True
             alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
-
-        # 2. Fiyat Düştü veya Hedef Fiyata Ulaşıldı
         elif curr_stock and curr_price > 0:
             if target_price > 0 and curr_price <= target_price and prev_price > target_price:
                 notify = True
@@ -274,7 +302,6 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                 notify = True
                 alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
-        # Bilgileri Güncelle
         tracked_products[url]["in_stock"] = curr_stock
         tracked_products[url]["last_price"] = curr_price
         updated = True
@@ -302,7 +329,6 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Komut Kayıtları
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("ekle", add_product))
     app.add_handler(CommandHandler("liste", list_products))
@@ -310,9 +336,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("durum", status_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
-    # Arka Plan Görevi: 10 Dakikada bir (600 saniye) çalışır
     app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
 
     print("Bot başarıyla başlatıldı!")
     app.run_polling()
-
