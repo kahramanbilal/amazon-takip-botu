@@ -19,26 +19,10 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # ================= ORTAM DEĞİŞKENLERİ =================
 TOKEN = os.environ.get("TELEGRAMTOKEN")
 CHAT_ID_ENV = os.environ.get("CHATID")
+SCRAPER_KEY = os.environ.get("SCRAPER_KEY")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
 DATA_FILE = "tracked_products.json"
-
-# Gelişmiş Tarayıcı Başlıkları (Amazon Bot Engeline Karşı)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1"
-}
 
 # ================= VERİ TABANI YÖNETİMİ =================
 
@@ -73,31 +57,27 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-def resolve_url(url: str) -> str:
-    try:
-        session = requests.Session()
-        res = session.head(url, headers=HEADERS, allow_redirects=True, timeout=10)
-        return res.url
-    except Exception:
-        return url
-
 def scrape_amazon(url: str):
     try:
-        session = requests.Session()
-        full_url = resolve_url(url)
-        res = session.get(full_url, headers=HEADERS, timeout=15)
+        # Eğer ScraperAPI key girilmişse isteği proxy üzerinden geçir
+        if SCRAPER_KEY:
+            target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={url}&country_code=tr"
+            headers = {}
+        else:
+            target_url = url
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept-Language": "tr-TR,tr;q=0.9"
+            }
+
+        res = requests.get(target_url, headers=headers, timeout=30)
         
         if res.status_code != 200:
-            logging.warning(f"Amazon Yanıtı Sayfayı Engelledi! Status: {res.status_code}")
+            logging.warning(f"Amazon Sayfası Yüklenemedi! Status: {res.status_code}")
             return None
 
         soup = BeautifulSoup(res.text, "html.parser")
         page_text = res.text.lower()
-
-        # Bot Tespiti / Captcha Kontrolü
-        if "api-services-support@amazon.com" in page_text or "robot" in page_text:
-            logging.warning("Amazon CAPTCHA / Bot engeline takıldı.")
-            return None
 
         # Ürün Başlığı
         title_el = soup.find("span", {"id": "productTitle"})
@@ -106,19 +86,19 @@ def scrape_amazon(url: str):
         # Fiyat Analizi
         prices = []
         
-        # 1. Yöntem: Ana Fiyat
+        # 1. Ana Fiyat
         price_span = soup.find("span", class_="a-price")
         if price_span:
             offscreen = price_span.find("span", class_="a-offscreen")
             if offscreen:
                 prices.append(parse_price(offscreen.get_text()))
 
-        # 2. Yöntem: Apex / Core Price
+        # 2. Apex / Core Price
         core_price = soup.find("span", {"id": "priceblock_ourprice"}) or soup.find("span", {"id": "priceblock_dealprice"})
         if core_price:
             prices.append(parse_price(core_price.get_text()))
 
-        # 3. Yöntem: Diğer Satıcılar
+        # 3. Diğer Satıcılar Fiyatı
         other_sellers_box = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
         if other_sellers_box:
             other_prices = other_sellers_box.find_all("span", class_="a-color-price")
@@ -128,7 +108,7 @@ def scrape_amazon(url: str):
         valid_prices = [p for p in prices if p > 0]
         lowest_price = min(valid_prices) if valid_prices else 0.0
 
-        # Stok Durumu Gelişmiş Kontrol
+        # Stok Durumu Kontrolü
         out_keywords = [
             "şu anda stokta yok", 
             "geçici olarak temin edilememektedir", 
@@ -136,10 +116,8 @@ def scrape_amazon(url: str):
             "bu ürün şu anda mevcut değil"
         ]
         
-        # Açıkça stokta yok yazıyor mu?
         explicitly_out = any(kw in page_text for kw in out_keywords)
         
-        # Sepete ekle / Hemen Al butonu veya fiyat var mı?
         has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
                          (soup.find("input", {"id": "buy-now-button"}) is not None) or \
                          (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
@@ -150,7 +128,7 @@ def scrape_amazon(url: str):
             "title": title[:40] + "..." if len(title) > 40 else title,
             "price": lowest_price,
             "in_stock": in_stock,
-            "real_url": full_url
+            "real_url": url
         }
     except Exception as e:
         logging.error(f"Scraping hatası ({url}): {e}")
@@ -203,7 +181,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = scrape_amazon(url)
 
     if not data:
-        await msg.edit_text("❌ Ürün bilgileri çekilemedi (Amazon korumasına takılmış olabilir). Lütfen tekrar deneyin.")
+        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Lütfen linki kontrol edip tekrar deneyin.")
         return
 
     real_url = data["real_url"]
