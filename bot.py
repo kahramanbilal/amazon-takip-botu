@@ -25,28 +25,53 @@ NPOINT_ID = os.environ.get("NPOINT_ID")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
 
-# ================= BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
+# ================= KORUMALI BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
+
+# Global durum takibi: Veritabanı başarılı yüklendi mi?
+DATA_LOADED_SUCCESSFULLY = False
 
 def load_data() -> dict:
+    global DATA_LOADED_SUCCESSFULLY
     if not NPOINT_ID:
         logging.warning("NPOINT_ID değişkeni bulunamadı.")
         return {}
-    try:
-        res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            return data if isinstance(data, dict) else {}
-    except Exception as e:
-        logging.error(f"NPoint yükleme hatası: {e}")
+    
+    # Anlık sunucu yavaşlamalarına karşı 3 defa tekrar deneme
+    for attempt in range(3):
+        try:
+            res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, dict):
+                    DATA_LOADED_SUCCESSFULLY = True
+                    logging.info("NPoint veritabanı başarıyla yüklendi.")
+                    return data
+        except Exception as e:
+            logging.warning(f"NPoint yükleme denemesi {attempt + 1}/3 başarısız: {e}")
+            
+    logging.error("NPoint verisine ulaşılamadı! Eski verilerin silinmemesi için kaydetme kilitlendi.")
     return {}
 
 def save_data(data: dict):
+    global DATA_LOADED_SUCCESSFULLY
     if not NPOINT_ID:
         return
-    try:
-        requests.post(f"https://api.npoint.io/{NPOINT_ID}", json=data, timeout=10)
-    except Exception as e:
-        logging.error(f"NPoint kaydetme hatası: {e}")
+    
+    # EĞER YÜKLEME BAŞARISIZ OLDUYSA VE ELİMİZDEKİ VERİ BOŞSA, NPOINT'İ SIFIRLAMA!
+    if not DATA_LOADED_SUCCESSFULLY and not data:
+        logging.error("Veritabanı başlangıçta yüklenemediği için sıfırlama engellendi!")
+        return
+
+    for attempt in range(3):
+        try:
+            res = requests.post(f"https://api.npoint.io/{NPOINT_ID}", json=data, timeout=15)
+            if res.status_code == 200:
+                DATA_LOADED_SUCCESSFULLY = True
+                return
+        except Exception as e:
+            logging.warning(f"NPoint kaydetme denemesi {attempt + 1}/3 başarısız: {e}")
+            
+    logging.error("NPoint verisi kaydedilemedi!")
 
 tracked_products = load_data()
 
@@ -92,7 +117,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AKILLI VE AKIŞKAN AMAZON SCRAPER =================
+# ================= AKILLI VE KORUMALI AMAZON SCRAPER =================
 
 def scrape_amazon(raw_url: str):
     try:
@@ -282,7 +307,9 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global tracked_products
-    tracked_products = load_data()
+    fresh_data = load_data()
+    if fresh_data:
+        tracked_products = fresh_data
 
     if not tracked_products:
         await update.message.reply_text("📋 Şu anda takip edilen hiç ürün yok.")
@@ -415,7 +442,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
     global tracked_products
     try:
-        tracked_products = load_data()
+        fresh_data = load_data()
+        if fresh_data:
+            tracked_products = fresh_data
+
         if not tracked_products or not ALLOWED_CHAT_ID:
             return
 
