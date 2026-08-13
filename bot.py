@@ -99,7 +99,6 @@ def scrape_amazon(raw_url: str):
         }
 
         res = None
-        # 1. ScraperAPI İle Deneme
         if SCRAPER_KEY:
             try:
                 target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr&render=true"
@@ -115,7 +114,6 @@ def scrape_amazon(raw_url: str):
                 except Exception:
                     pass
 
-        # 2. Doğrudan Bağlantı Denemesi (Yedek)
         if not res or res.status_code != 200 or "productTitle" not in res.text:
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
@@ -139,52 +137,50 @@ def scrape_amazon(raw_url: str):
         
         title = title_el.get_text(strip=True)
 
-        # 2. FİYAT ÇEKME (Taksit/Kupon Filtreli)
-        extracted_price = 0.0
+        # 2. HEM SIFIR HEM İKİNCİ EL/DEPO FİYATLARINI ALIP EN DÜŞÜĞÜNÜ SEÇME
+        found_prices = []
+        is_used = False
 
-        buybox_selectors = [
+        price_selectors = [
             "#corePrice_feature_div .a-price .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
             "#apex_desktop .a-price .a-offscreen",
+            "#usedAccordion .a-price .a-offscreen",          # İkinci el Akordiyon alanı
+            "#usedBuyBox .a-price .a-offscreen",            # İkinci el BuyBox
+            "#moreBuyingChoices_feature_div .a-price .a-offscreen", # Diğer Satıcılar / İkinci el
             "#priceblock_ourprice",
             "#priceblock_dealprice"
         ]
 
-        for sel in buybox_selectors:
+        for sel in price_selectors:
             elements = soup.select(sel)
             for el in elements:
                 p = parse_price(el.get_text())
-                if p > 500.0:  # 500 TL altı kupon/taksit tutarlarını elemek için
-                    extracted_price = p
-                    break
-            if extracted_price > 0:
-                break
+                if p > 500.0:  # Kupon/taksit tutarlarını elemek için
+                    found_prices.append(p)
 
-        if extracted_price == 0.0:
-            whole = soup.find("span", class_="a-price-whole")
-            fraction = soup.find("span", class_="a-price-fraction")
-            if whole:
-                w_str = whole.get_text(strip=True)
-                f_str = fraction.get_text(strip=True) if fraction else "00"
-                p = parse_price(f"{w_str},{f_str}")
-                if p > 0:
-                    extracted_price = p
+        # Sayfada İkinci El İbaresi veya İkinci El Fiyatı Var mı Kontrol Et
+        used_keywords = ["ikinci el", "kullanılmış", "fırsat ürünleri", "amazon warehouse", "used"]
+        has_used_mention = any(kw in html_text.lower() for kw in used_keywords)
+
+        extracted_price = min(found_prices) if found_prices else 0.0
+
+        # Eğer bulunan en düşük fiyat ana fiyattan ucuzsa ve sayfada ikinci el ibaresi varsa:
+        if extracted_price > 0 and has_used_mention:
+            # İkinci el fiyatı olma ihtimali yüksek
+            is_used = True
 
         # 3. STOK KONTROLÜ
         out_keywords = ["şu anda stokta yok", "currently unavailable", "geçici olarak temin edilememektedir"]
         is_out = any(kw in html_text.lower() for kw in out_keywords)
 
-        has_buy_button = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
-                         (soup.find("input", {"id": "buy-now-button"}) is not None) or \
-                         (soup.find("span", {"id": "submit.add-to-cart"}) is not None) or \
-                         (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
-
-        in_stock = not is_out and (has_buy_button or extracted_price > 0)
+        in_stock = not is_out and extracted_price > 0
 
         return {
             "title": title[:45] + "..." if len(title) > 45 else title,
             "price": extracted_price,
             "in_stock": in_stock,
+            "is_used": is_used,
             "real_url": real_url
         }
     except Exception as e:
@@ -328,6 +324,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
 
         curr_stock = current_data["in_stock"]
         curr_price = current_data["price"]
+        is_used = current_data.get("is_used", False)
 
         notify = False
         alert_reason = ""
@@ -338,10 +335,12 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         elif curr_stock and curr_price > 0:
             if target_price > 0 and curr_price <= target_price and prev_price > target_price:
                 notify = True
-                alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b> (Hedef: {target_price:.2f} TL)"
+                tag = " (♻️ İkinci El / Depo Fırsatı)" if is_used else ""
+                alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b> (Hedef: {target_price:.2f} TL)"
             elif curr_price < prev_price and prev_price > 0:
                 notify = True
-                alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+                tag = "\n♻️ <i>(İkinci El / Depo Seçeneği eklendi/düştü)</i>" if is_used else ""
+                alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
         tracked_products[url]["in_stock"] = curr_stock
         tracked_products[url]["last_price"] = curr_price
