@@ -25,7 +25,7 @@ NPOINT_ID = os.environ.get("NPOINT_ID")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
 
-# ================= BULUT VERİ TABANI YÖNETİMİ =================
+# ================= BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
 
 def load_data() -> dict:
     if not NPOINT_ID:
@@ -92,7 +92,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= ODANMIŞ VE KORUMALI AMAZON SCRAPER =================
+# ================= AKILLI VE AKIŞKAN AMAZON SCRAPER =================
 
 def scrape_amazon(raw_url: str):
     try:
@@ -141,23 +141,37 @@ def scrape_amazon(raw_url: str):
         title = title_el.get_text(strip=True)
         extracted_price = 0.0
 
-        # YALNIZCA ANA ÜRÜN BEYAN FİYATI (Taksit, kargo ve kupon metinleri tamamen hariç tutulur)
-        main_price_box = soup.find("div", {"id": "apex_desktop"}) or soup.find("div", {"id": "corePrice_feature_div"}) or soup.find("div", {"id": "corePriceDisplay_desktop_feature_div"})
-        
-        if main_price_box:
-            # Ana fiyat kutusunun içindeki 'a-offscreen' alanını çek
-            price_el = main_price_box.find("span", class_="a-offscreen")
-            if price_el:
-                extracted_price = parse_price(price_el.get_text())
+        # 1. Aşama: Birincil Öncelikli Ana Fiyat Kutuları
+        main_selectors = [
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#booksHeaderSection .a-price .a-offscreen",
+            "#price_inside_buybox",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+            "#priceblock_saleprice"
+        ]
 
-        # Eğer ana kutudan fiyat çıkmadıysa alternatif buybox bileşenlerini kontrol et
+        for sel in main_selectors:
+            el = soup.select_one(sel)
+            if el:
+                p = parse_price(el.get_text())
+                if p > 0.0:
+                    extracted_price = p
+                    break
+
+        # 2. Aşama: Akıllı Fallback (Taksit/Aksesuar tuzağına düşmeden en baskın/yüksek fiyatı alma)
         if extracted_price == 0.0:
-            for fallback_id in ["price_inside_buybox", "priceblock_ourprice", "priceblock_dealprice", "priceblock_saleprice"]:
-                el = soup.find(id=fallback_id)
-                if el:
-                    extracted_price = parse_price(el.get_text())
-                    if extracted_price > 0.0:
-                        break
+            all_prices = []
+            for el in soup.select(".a-price .a-offscreen"):
+                p = parse_price(el.get_text())
+                if p > 0.0:
+                    all_prices.append(p)
+            
+            if all_prices:
+                # Taksitler küçük (örn 300 TL, 84 TL), asıl ürün fiyatı büyük olacağı için max() alıyoruz
+                extracted_price = max(all_prices)
 
         # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
