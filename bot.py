@@ -54,7 +54,7 @@ tracked_products = load_data()
 
 def get_tr_time() -> str:
     tr_tz = timezone(timedelta(hours=3))
-    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylul", "Ekim", "Kasım", "Aralık"]
+    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
     now = datetime.now(tr_tz)
     return f"{now.day} {months[now.month - 1]} {now.strftime('%H:%M')}"
 
@@ -74,19 +74,16 @@ def parse_price(price_str: str) -> float:
     if not price_str:
         return 0.0
     try:
-        # Metindeki sayısal olmayan (nokta ve virgül hariç) karakterleri temizle
         clean = re.sub(r"[^\d.,]", "", str(price_str)).strip()
         if not clean:
             return 0.0
 
-        # Binlik ve ondalık ayrım kontrolü (Türkiye formatı: 15.999,00 TL veya 15999,00)
         if "." in clean and "," in clean:
             clean = clean.replace(".", "").replace(",", ".")
         elif "," in clean:
             clean = clean.replace(",", ".")
         elif "." in clean:
             parts = clean.split(".")
-            # Eğer noktadan sonra 3 basamak varsa bu binlik ayracıdır (örn: 15.999)
             if len(parts[-1]) == 3:
                 clean = clean.replace(".", "")
 
@@ -141,43 +138,46 @@ def scrape_amazon(raw_url: str):
         
         title = title_el.get_text(strip=True)
 
-        found_prices = []
-        
-        # Genişletilmiş ve Kapsamlı Amazon Fiyat Seçicileri
-        price_selectors = [
+        extracted_price = 0.0
+
+        # Birincil Fiyat Blokları (Sadece ana ürün fiyatının yer aldığı alanlar)
+        primary_selectors = [
             "#corePrice_feature_div .a-price .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
             "#apex_desktop .a-price .a-offscreen",
             "#price_inside_buybox",
             "#priceblock_ourprice",
             "#priceblock_dealprice",
-            "#priceblock_saleprice",
-            ".a-price .a-offscreen",
-            "span.a-price-whole",
-            "#usedAccordion .a-price .a-offscreen",
-            "#moreBuyingChoices_feature_div .a-price .a-offscreen"
+            "#priceblock_saleprice"
         ]
 
-        for sel in price_selectors:
-            elements = soup.select(sel)
-            for el in elements:
+        for sel in primary_selectors:
+            el = soup.select_one(sel)
+            if el:
                 p = parse_price(el.get_text())
-                if p > 0.0:
-                    found_prices.append(p)
+                if p > 100.0:  # Taksit/Kargo gibi küçük sayıları filtresiz almamak için eşik
+                    extracted_price = p
+                    break
 
-        # Eğer özel seçiciler fiyat bulamazsa genel arama yap
-        if not found_prices:
-            all_price_tags = soup.find_all(class_=re.compile(r"a-price|priceBlock", re.I))
-            for tag in all_price_tags:
-                p = parse_price(tag.get_text())
-                if p > 0.0:
-                    found_prices.append(p)
+        # Eğer birincil bloklarda bulunamadıysa ikincil alanları tara
+        if extracted_price == 0.0:
+            secondary_selectors = [
+                "#usedAccordion .a-price .a-offscreen",
+                "#moreBuyingChoices_feature_div .a-price .a-offscreen",
+                ".a-price .a-offscreen"
+            ]
+            for sel in secondary_selectors:
+                elements = soup.select(sel)
+                for el in elements:
+                    p = parse_price(el.get_text())
+                    if p > 100.0:
+                        extracted_price = p
+                        break
+                if extracted_price > 0.0:
+                    break
 
-        extracted_price = min(found_prices) if found_prices else 0.0
-
-        # Stok Durumu Kontrolü (Fiyat varsa VEYA 'Sepete Ekle' / 'Şimdi Al' butonu varsa)
+        # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
-        
         in_stock = (extracted_price > 0.0) or has_buy_button
 
         used_keywords = ["ikinci el", "kullanılmış", "fırsat ürünleri", "amazon warehouse", "used"]
