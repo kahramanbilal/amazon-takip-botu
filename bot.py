@@ -140,7 +140,7 @@ def scrape_amazon(raw_url: str):
         
         title = title_el.get_text(strip=True)
 
-        # 2. HEM SIFIR HEM İKİNCİ EL/DEPO FİYATLARINI ALIP EN DÜŞÜĞÜNÜ SEÇME
+        # 2. FİYAT ÇEKME
         found_prices = []
 
         price_selectors = [
@@ -167,8 +167,20 @@ def scrape_amazon(raw_url: str):
         used_keywords = ["ikinci el", "kullanılmış", "fırsat ürünleri", "amazon warehouse", "used"]
         is_used = any(kw in html_text.lower() for kw in used_keywords)
 
-        # 3. KESİN STOK MANTIĞI
-        # Amazon buton yapılarını değiştirdiği için, sayfada fiyat okunabiliyorsa ürün STOKTADIR.
+        # 3. KUPON VEYA FIRSAT TESPİTİ
+        has_coupon = False
+        coupon_selectors = ["#promoPriceBlockMessage_feature_div", "#vPCBadge", "#applicable_promotion_list", ".voucher-badge"]
+        for c_sel in coupon_selectors:
+            if soup.select(c_sel):
+                has_coupon = True
+                break
+        
+        if not has_coupon:
+            coupon_keywords = ["kuponu uygula", "kupon", "sepette %", "sepette indirim", "indirim kuponu"]
+            if any(ck in html_text.lower() for ck in coupon_keywords):
+                has_coupon = True
+
+        # 4. KESİN STOK MANTIĞI
         in_stock = extracted_price > 0.0
 
         return {
@@ -176,6 +188,7 @@ def scrape_amazon(raw_url: str):
             "price": extracted_price,
             "in_stock": in_stock,
             "is_used": is_used,
+            "has_coupon": has_coupon,
             "real_url": real_url
         }
     except Exception as e:
@@ -194,10 +207,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     welcome_text = (
-        "🤖 <b>Amazon Stok & Fiyat Takip Botu Aktif!</b>\n\n"
+        "🤖 <b>Amazon Stok & Fiyat Takip Botu Pro!</b>\n\n"
         "<b>Komutlar:</b>\n"
         "▫️ `/ekle [link] [hedef_fiyat]` - Takip ekler\n"
         "▫️ `/liste` - Takip edilen tüm ürünleri gösterir\n"
+        "▫️ `/tara` - Tüm ürünleri anında taranmaya zorlar\n"
+        "▫️ `/gecmis [sıra_no]` - Ürünün fiyat geçmişini gösterir\n"
         "▫️ `/sil [sıra_no]` - Listeden ürün çıkarır\n"
         "▫️ `/durum` - Sistem durumunu raporlar\n\n"
         "💡 <i>Doğrudan bir Amazon linki de gönderebilirsiniz!</i>"
@@ -233,21 +248,28 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     real_url = data["real_url"]
+    
+    # Yeni eklendiğinde fiyat geçmişine ilk değer atanır
+    history = [data["price"]] if data["price"] > 0 else []
+
     tracked_products[real_url] = {
         "title": data["title"],
         "last_price": data["price"],
         "target_price": target_price,
-        "in_stock": data["in_stock"]
+        "in_stock": data["in_stock"],
+        "has_coupon": data["has_coupon"],
+        "history": history
     }
     save_data(tracked_products)
 
     status_str = f"✅ Stokta ({data['price']:.2f} TL)" if data["in_stock"] else "❌ Stokta Yok"
     target_str = f"\n🎯 <b>Hedef Fiyat:</b> {target_price:.2f} TL" if target_price > 0 else ""
+    coupon_str = "\n🎟 <b>Kupon/Fırsat Var!</b>" if data["has_coupon"] else ""
 
     reply = (
         f"🎯 <b>Ürün Takibe Eklendi!</b>\n\n"
         f"📦 <b>Ürün:</b> {data['title']}\n"
-        f"📊 <b>Durum:</b> {status_str}{target_str}\n"
+        f"📊 <b>Durum:</b> {status_str}{target_str}{coupon_str}\n"
         f"🔗 <a href='{real_url}'>Ürüne Git</a>"
     )
     await msg.edit_text(reply, parse_mode="HTML", disable_web_page_preview=True)
@@ -267,10 +289,49 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, (url, info) in enumerate(tracked_products.items(), 1):
         stok_durum = f"✅ {info['last_price']:.2f} TL" if info["in_stock"] else "❌ Stokta Yok"
         target_info = f" (Hedef: {info['target_price']:.2f} TL)" if info.get("target_price", 0) > 0 else ""
-        text += f"<b>{idx}.</b> {info['title']}\n   └ Durum: {stok_durum}{target_info}\n   └ <a href='{url}'>Link</a>\n\n"
+        coupon_badge = " 🎟 [Kupon]" if info.get("has_coupon", False) else ""
+        
+        text += f"<b>{idx}.</b> {info['title']}{coupon_badge}\n   └ Durum: {stok_durum}{target_info}\n   └ <a href='{url}'>Link</a>\n\n"
 
-    text += "<i>Silmek için: <code>/sil [sıra_no]</code></i>"
+    text += "<i>İşlemler: <code>/sil [no]</code> | <code>/gecmis [no]</code> | <code>/tara</code></i>"
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Lütfen fiyat geçmişini görmek istediğiniz ürünün numarasını girin. Örn: `/gecmis 1`", parse_mode="Markdown")
+        return
+
+    index = int(context.args[0]) - 1
+    urls = list(tracked_products.keys())
+
+    if index < 0 or index >= len(urls):
+        await update.message.reply_text("❌ Geçersiz sıra numarası.")
+        return
+
+    target_url = urls[index]
+    product = tracked_products[target_url]
+    history = product.get("history", [])
+
+    if not history:
+        await update.message.reply_text(f"📉 <b>{product['title']}</b> için henüz yeterli fiyat geçmişi kaydı yok.", parse_mode="HTML")
+        return
+
+    hist_text = f"📈 <b>FİYAT GEÇMİŞİ</b>\n📦 <b>{product['title']}</b>\n\n"
+    for i, p in enumerate(reversed(history), 1):
+        hist_text += f"• Kayıt {i}: <b>{p:.2f} TL</b>\n"
+
+    await update.message.reply_text(hist_text, parse_mode="HTML")
+
+async def force_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+
+    msg = await update.message.reply_text("🔄 Anlık tarama başlatıldı, tüm ürünler kontrol ediliyor...")
+    await check_all_products_job(context)
+    await msg.edit_text("✅ Anlık tarama tamamlandı!")
 
 async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -315,18 +376,23 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
 
         prev_stock = info["in_stock"]
         prev_price = info["last_price"]
+        prev_coupon = info.get("has_coupon", False)
         target_price = info.get("target_price", 0.0)
 
         curr_stock = current_data["in_stock"]
         curr_price = current_data["price"]
+        curr_coupon = current_data["has_coupon"]
         is_used = current_data.get("is_used", False)
 
         notify = False
         alert_reason = ""
 
+        # 1. Stok Değişim Alarmı
         if curr_stock and not prev_stock:
             notify = True
             alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
+
+        # 2. Fiyat Değişim Alarmı
         elif curr_stock and curr_price > 0:
             if target_price > 0 and curr_price <= target_price and prev_price > target_price:
                 notify = True
@@ -334,11 +400,26 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                 alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b> (Hedef: {target_price:.2f} TL)"
             elif curr_price < prev_price and prev_price > 0:
                 notify = True
-                tag = "\n♻️ <i>(İkinci El / Depo Seçeneği eklendi/düştü)</i>" if is_used else ""
+                tag = "\n♻️ <i>(İkinci El / Depo Seçeneği)</i>" if is_used else ""
                 alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+
+        # 3. Kupon / Fırsat Alarmı
+        if curr_stock and curr_coupon and not prev_coupon:
+            notify = True
+            coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>\nSayfada uygulanabilir bir kupon veya sepet indirimi belirdi!"
+            alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
+
+        # Fiyat Geçmişini Güncelleme (Son 5 Kayıt Saklanır)
+        history = info.get("history", [])
+        if curr_price > 0 and (not history or history[-1] != curr_price):
+            history.append(curr_price)
+            if len(history) > 5:
+                history.pop(0)
 
         tracked_products[url]["in_stock"] = curr_stock
         tracked_products[url]["last_price"] = curr_price
+        tracked_products[url]["has_coupon"] = curr_coupon
+        tracked_products[url]["history"] = history
         updated = True
 
         if notify:
@@ -367,6 +448,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("ekle", add_product))
     app.add_handler(CommandHandler("liste", list_products))
+    app.add_handler(CommandHandler("gecmis", show_history))
+    app.add_handler(CommandHandler("tara", force_scan))
     app.add_handler(CommandHandler("sil", delete_product))
     app.add_handler(CommandHandler("durum", status_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
