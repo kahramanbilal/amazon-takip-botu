@@ -1,5 +1,1 @@
-
-python-telegram-bot[job-queue]
-beautifulsoup4
-requests
-
+pip install "python-telegram-bot[job-queue]" requests beautifulsoup4
