@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import requests
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import (
@@ -50,6 +51,13 @@ def save_data(data: dict):
 tracked_products = load_data()
 
 # ================= YARDIMCI FONKSİYONLAR =================
+
+def get_tr_time() -> str:
+    """Mevcut zamanı Türkiye Saati (UTC+3) ile string olarak döndürür."""
+    tr_tz = timezone(timedelta(hours=3))
+    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+    now = datetime.now(tr_tz)
+    return f"{now.day} {months[now.month - 1]} {now.strftime('%H:%M')}"
 
 def resolve_url(url: str) -> str:
     """Kısa amzn.eu linklerini uzun Amazon ürün linkine dönüştürür."""
@@ -210,8 +218,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Amazon Stok & Fiyat Takip Botu Pro!</b>\n\n"
         "<b>Komutlar:</b>\n"
         "▫️ `/ekle [link] [hedef_fiyat]` - Takip ekler\n"
-        "▫️ `/liste` - Takip edilen tüm ürünleri gösterir\n"
-        "▫️ `/tara` - Tüm ürünleri anında taranmaya zorlar\n"
+        "▫️ `/liste` - Takip edilen ürünleri ve son tarama zamanını gösterir\n"
+        "▫️ `/fiyat [sıra_no]` - Seçilen ürünün canlı anlık fiyatını çeker\n"
+        "▫️ `/tara` - Tüm ürünler için anında arka plan taraması başlatır\n"
         "▫️ `/gecmis [sıra_no]` - Ürünün fiyat geçmişini gösterir\n"
         "▫️ `/sil [sıra_no]` - Listeden ürün çıkarır\n"
         "▫️ `/durum` - Sistem durumunu raporlar\n\n"
@@ -248,8 +257,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     real_url = data["real_url"]
-    
-    # Yeni eklendiğinde fiyat geçmişine ilk değer atanır
+    now_tr = get_tr_time()
     history = [data["price"]] if data["price"] > 0 else []
 
     tracked_products[real_url] = {
@@ -258,6 +266,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "target_price": target_price,
         "in_stock": data["in_stock"],
         "has_coupon": data["has_coupon"],
+        "last_check": now_tr,
         "history": history
     }
     save_data(tracked_products)
@@ -270,6 +279,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 <b>Ürün Takibe Eklendi!</b>\n\n"
         f"📦 <b>Ürün:</b> {data['title']}\n"
         f"📊 <b>Durum:</b> {status_str}{target_str}{coupon_str}\n"
+        f"🕒 <b>Tarama Zamanı:</b> {now_tr}\n"
         f"🔗 <a href='{real_url}'>Ürüne Git</a>"
     )
     await msg.edit_text(reply, parse_mode="HTML", disable_web_page_preview=True)
@@ -290,11 +300,64 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stok_durum = f"✅ {info['last_price']:.2f} TL" if info["in_stock"] else "❌ Stokta Yok"
         target_info = f" (Hedef: {info['target_price']:.2f} TL)" if info.get("target_price", 0) > 0 else ""
         coupon_badge = " 🎟 [Kupon]" if info.get("has_coupon", False) else ""
+        last_check = info.get("last_check", "Henüz taranmadı")
         
-        text += f"<b>{idx}.</b> {info['title']}{coupon_badge}\n   └ Durum: {stok_durum}{target_info}\n   └ <a href='{url}'>Link</a>\n\n"
+        text += (
+            f"<b>{idx}.</b> {info['title']}{coupon_badge}\n"
+            f"   └ Durum: {stok_durum}{target_info}\n"
+            f"   └ 🕒 Son Tarama: {last_check}\n"
+            f"   └ <a href='{url}'>Link</a>\n\n"
+        )
 
-    text += "<i>İşlemler: <code>/sil [no]</code> | <code>/gecmis [no]</code> | <code>/tara</code></i>"
+    text += "<i>İşlemler: <code>/fiyat [no]</code> | <code>/gecmis [no]</code> | <code>/sil [no]</code></i>"
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Seçilen ürün için anlık canlı fiyat sorgular."""
+    if not is_authorized(update):
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Lütfen anlık fiyatını sorgulamak istediğiniz ürünün numarasını girin. Örn: `/fiyat 1`", parse_mode="Markdown")
+        return
+
+    index = int(context.args[0]) - 1
+    urls = list(tracked_products.keys())
+
+    if index < 0 or index >= len(urls):
+        await update.message.reply_text("❌ Geçersiz sıra numarası.")
+        return
+
+    target_url = urls[index]
+    product = tracked_products[target_url]
+
+    msg = await update.message.reply_text(f"⚡ <b>{product['title']}</b> için canlı fiyat sorgulanıyor...", parse_mode="HTML")
+    
+    current_data = scrape_amazon(target_url)
+    now_tr = get_tr_time()
+
+    if not current_data:
+        await msg.edit_text("❌ Anlık fiyat çekilemedi. Amazon engeline takılmış olabilir, lütfen biraz sonra tekrar deneyin.")
+        return
+
+    # Veriyi güncelle
+    tracked_products[target_url]["last_price"] = current_data["price"]
+    tracked_products[target_url]["in_stock"] = current_data["in_stock"]
+    tracked_products[target_url]["has_coupon"] = current_data["has_coupon"]
+    tracked_products[target_url]["last_check"] = now_tr
+    save_data(tracked_products)
+
+    stok_str = f"✅ {current_data['price']:.2f} TL" if current_data["in_stock"] else "❌ Stokta Yok"
+    coupon_str = "\n🎟 <b>Kupon/Fırsat:</b> Var" if current_data["has_coupon"] else ""
+
+    res_text = (
+        f"⚡ <b>ANLIK FİYAT BİLGİSİ</b>\n\n"
+        f"📦 <b>Ürün:</b> {current_data['title']}\n"
+        f"💰 <b>Anlık Durum:</b> {stok_str}{coupon_str}\n"
+        f"🕒 <b>Sorgu Tarihi (TSİ):</b> {now_tr}\n"
+        f"🔗 <a href='{target_url}'>Ürüne Git</a>"
+    )
+    await msg.edit_text(res_text, parse_mode="HTML", disable_web_page_preview=True)
 
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -329,9 +392,9 @@ async def force_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    msg = await update.message.reply_text("🔄 Anlık tarama başlatıldı, tüm ürünler kontrol ediliyor...")
+    msg = await update.message.reply_text("🔄 Anlık toplu tarama başlatıldı, tüm ürünler kontrol ediliyor...")
     await check_all_products_job(context)
-    await msg.edit_text("✅ Anlık tarama tamamlandı!")
+    await msg.edit_text("✅ Anlık toplu tarama tamamlandı!")
 
 async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -369,6 +432,8 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     updated = False
+    now_tr = get_tr_time()
+
     for url, info in list(tracked_products.items()):
         current_data = scrape_amazon(url)
         if not current_data:
@@ -409,7 +474,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>\nSayfada uygulanabilir bir kupon veya sepet indirimi belirdi!"
             alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
 
-        # Fiyat Geçmişini Güncelleme (Son 5 Kayıt Saklanır)
+        # Fiyat Geçmişini Güncelleme
         history = info.get("history", [])
         if curr_price > 0 and (not history or history[-1] != curr_price):
             history.append(curr_price)
@@ -419,6 +484,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         tracked_products[url]["in_stock"] = curr_stock
         tracked_products[url]["last_price"] = curr_price
         tracked_products[url]["has_coupon"] = curr_coupon
+        tracked_products[url]["last_check"] = now_tr
         tracked_products[url]["history"] = history
         updated = True
 
@@ -426,6 +492,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             msg = (
                 f"{alert_reason}\n\n"
                 f"📦 <b>{current_data['title']}</b>\n"
+                f"🕒 <b>Tarih:</b> {now_tr}\n"
                 f"🔗 <a href='{url}'>Ürüne Gitmek İçin Tıklayın</a>"
             )
             try:
@@ -448,6 +515,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("ekle", add_product))
     app.add_handler(CommandHandler("liste", list_products))
+    app.add_handler(CommandHandler("fiyat", get_instant_price))
     app.add_handler(CommandHandler("gecmis", show_history))
     app.add_handler(CommandHandler("tara", force_scan))
     app.add_handler(CommandHandler("sil", delete_product))
