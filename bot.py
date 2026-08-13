@@ -27,7 +27,6 @@ ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else
 
 # ================= KORUMALI BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
 
-# Global durum takibi: Veritabanı başarılı yüklendi mi?
 DATA_LOADED_SUCCESSFULLY = False
 
 def load_data() -> dict:
@@ -36,7 +35,6 @@ def load_data() -> dict:
         logging.warning("NPOINT_ID değişkeni bulunamadı.")
         return {}
     
-    # Anlık sunucu yavaşlamalarına karşı 3 defa tekrar deneme
     for attempt in range(3):
         try:
             res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=15)
@@ -57,7 +55,6 @@ def save_data(data: dict):
     if not NPOINT_ID:
         return
     
-    # EĞER YÜKLEME BAŞARISIZ OLDUYSA VE ELİMİZDEKİ VERİ BOŞSA, NPOINT'İ SIFIRLAMA!
     if not DATA_LOADED_SUCCESSFULLY and not data:
         logging.error("Veritabanı başlangıçta yüklenemediği için sıfırlama engellendi!")
         return
@@ -96,6 +93,7 @@ def resolve_url(url: str) -> str:
         return url
 
 def parse_price(price_str: str) -> float:
+    """Tüm yerel ve küresel para birimi formatlarını hatasız ayrıştıran gelişmiş fonksiyon."""
     if not price_str:
         return 0.0
     try:
@@ -104,12 +102,23 @@ def parse_price(price_str: str) -> float:
             return 0.0
 
         if "." in clean and "," in clean:
-            clean = clean.replace(".", "").replace(",", ".")
+            if clean.rfind(",") > clean.rfind("."):
+                # TR Formatı: 15.199,00 -> 15199.00
+                clean = clean.replace(".", "").replace(",", ".")
+            else:
+                # EN Formatı: 15,199.00 -> 15199.00
+                clean = clean.replace(",", "")
         elif "," in clean:
-            clean = clean.replace(",", ".")
+            parts = clean.split(",")
+            if len(parts[-1]) == 2:
+                clean = clean.replace(",", ".")
+            elif len(parts[-1]) == 3 and len(parts) > 1:
+                clean = clean.replace(",", "")
+            else:
+                clean = clean.replace(",", ".")
         elif "." in clean:
             parts = clean.split(".")
-            if len(parts[-1]) == 3:
+            if len(parts[-1]) == 3 and len(parts) > 1:
                 clean = clean.replace(".", "")
 
         val = float(clean)
@@ -117,7 +126,58 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AKILLI VE KORUMALI AMAZON SCRAPER =================
+# ================= TAM ZIRHLI AMAZON SCRAPER =================
+
+def extract_price_from_soup(soup) -> float:
+    """Amazon HTML'inden doğrudan bütünleşmiş fiyat tespiti yapar."""
+    # 1. Öncelik: Amazon'un Parçalı HTML Yapısı (a-price-whole + a-price-fraction)
+    # Bu yöntem basamak/virgül kaymalarını tamamen engeller.
+    price_containers = [
+        "#corePrice_feature_div .a-price",
+        "#corePriceDisplay_desktop_feature_div .a-price",
+        "#apex_desktop .a-price",
+        ".a-price"
+    ]
+
+    for container in price_containers:
+        for p_box in soup.select(container):
+            whole = p_box.select_one(".a-price-whole")
+            fraction = p_box.select_one(".a-price-fraction")
+            if whole:
+                w_text = re.sub(r"[^\d]", "", whole.get_text())
+                f_text = re.sub(r"[^\d]", "", fraction.get_text()) if fraction else "00"
+                if w_text:
+                    p_val = float(f"{w_text}.{f_text}")
+                    if p_val > 0.0:
+                        return p_val
+
+    # 2. Öncelik: Standart Fiyat Kutuları (a-offscreen)
+    selectors = [
+        "#corePrice_feature_div .a-price .a-offscreen",
+        "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+        "#apex_desktop .a-price .a-offscreen",
+        "#booksHeaderSection .a-price .a-offscreen",
+        "#price_inside_buybox",
+        "#priceblock_ourprice",
+        "#priceblock_dealprice"
+    ]
+
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            p = parse_price(el.get_text())
+            if p > 0.0:
+                return p
+
+    # 3. Öncelik: Fallback (Bulunan tüm geçerli fiyatların maksimumunu seç - Taksitleri elemek için)
+    all_prices = []
+    for el in soup.select(".a-price .a-offscreen"):
+        p = parse_price(el.get_text())
+        if p > 0.0:
+            all_prices.append(p)
+
+    return max(all_prices) if all_prices else 0.0
+
 
 def scrape_amazon(raw_url: str):
     try:
@@ -164,39 +224,7 @@ def scrape_amazon(raw_url: str):
             return None
         
         title = title_el.get_text(strip=True)
-        extracted_price = 0.0
-
-        # 1. Aşama: Birincil Öncelikli Ana Fiyat Kutuları
-        main_selectors = [
-            "#corePrice_feature_div .a-price .a-offscreen",
-            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-            "#apex_desktop .a-price .a-offscreen",
-            "#booksHeaderSection .a-price .a-offscreen",
-            "#price_inside_buybox",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
-            "#priceblock_saleprice"
-        ]
-
-        for sel in main_selectors:
-            el = soup.select_one(sel)
-            if el:
-                p = parse_price(el.get_text())
-                if p > 0.0:
-                    extracted_price = p
-                    break
-
-        # 2. Aşama: Akıllı Fallback (Taksit/Aksesuar tuzağına düşmeden en baskın/yüksek fiyatı alma)
-        if extracted_price == 0.0:
-            all_prices = []
-            for el in soup.select(".a-price .a-offscreen"):
-                p = parse_price(el.get_text())
-                if p > 0.0:
-                    all_prices.append(p)
-            
-            if all_prices:
-                # Taksitler küçük (örn 300 TL, 84 TL), asıl ürün fiyatı büyük olacağı için max() alıyoruz
-                extracted_price = max(all_prices)
+        extracted_price = extract_price_from_soup(soup)
 
         # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
@@ -472,36 +500,32 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             notify = False
             alert_reason = ""
 
-            # Stok Alarmları
             if curr_stock and not prev_stock:
                 notify = True
                 alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
 
             elif curr_stock and curr_price > 0:
-                # Hedef Fiyat Alarmları
                 if target_price > 0 and curr_price <= target_price and prev_price > target_price:
                     notify = True
                     tag = " (♻️ İkinci El / Depo)" if is_used else ""
                     alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
                 
-                # Normal Fiyat Düşüş Alarmları (%80 sapma korumalı)
                 elif curr_price < prev_price and prev_price > 0:
                     drop_ratio = (prev_price - curr_price) / prev_price
+                    # %80 üzerindeki hatalı anlık düşüşlerde saçma bildirimleri engelleme
                     if drop_ratio > 0.80 and curr_price < 1000.0:
-                        logging.warning(f"Aşırı fiyat sapması tespit edildi, bildirim atlanıyor: {prev_price} -> {curr_price}")
+                        logging.warning(f"Aşırı fiyat sapması tespit edildi: {prev_price} -> {curr_price}")
                         notify = False
                     else:
                         notify = True
                         tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
                         alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
-            # Kupon Alarmları
             if curr_stock and curr_coupon and not prev_coupon:
                 notify = True
                 coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>"
                 alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
 
-            # Fiyat Geçmişi Güncelleme
             history = info.get("history", [])
             if curr_price > 0 and (not history or history[-1] != curr_price):
                 history.append(curr_price)
