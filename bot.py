@@ -92,6 +92,8 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
+# ================= ODANMIŞ VE KORUMALI AMAZON SCRAPER =================
+
 def scrape_amazon(raw_url: str):
     try:
         real_url = resolve_url(raw_url)
@@ -139,40 +141,25 @@ def scrape_amazon(raw_url: str):
         title = title_el.get_text(strip=True)
         extracted_price = 0.0
 
-        primary_selectors = [
-            "#corePrice_feature_div .a-price .a-offscreen",
-            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-            "#apex_desktop .a-price .a-offscreen",
-            "#price_inside_buybox",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
-            "#priceblock_saleprice"
-        ]
+        # YALNIZCA ANA ÜRÜN BEYAN FİYATI (Taksit, kargo ve kupon metinleri tamamen hariç tutulur)
+        main_price_box = soup.find("div", {"id": "apex_desktop"}) or soup.find("div", {"id": "corePrice_feature_div"}) or soup.find("div", {"id": "corePriceDisplay_desktop_feature_div"})
+        
+        if main_price_box:
+            # Ana fiyat kutusunun içindeki 'a-offscreen' alanını çek
+            price_el = main_price_box.find("span", class_="a-offscreen")
+            if price_el:
+                extracted_price = parse_price(price_el.get_text())
 
-        for sel in primary_selectors:
-            el = soup.select_one(sel)
-            if el:
-                p = parse_price(el.get_text())
-                if p > 100.0:
-                    extracted_price = p
-                    break
-
+        # Eğer ana kutudan fiyat çıkmadıysa alternatif buybox bileşenlerini kontrol et
         if extracted_price == 0.0:
-            secondary_selectors = [
-                "#usedAccordion .a-price .a-offscreen",
-                "#moreBuyingChoices_feature_div .a-price .a-offscreen",
-                ".a-price .a-offscreen"
-            ]
-            for sel in secondary_selectors:
-                elements = soup.select(sel)
-                for el in elements:
-                    p = parse_price(el.get_text())
-                    if p > 100.0:
-                        extracted_price = p
+            for fallback_id in ["price_inside_buybox", "priceblock_ourprice", "priceblock_dealprice", "priceblock_saleprice"]:
+                el = soup.find(id=fallback_id)
+                if el:
+                    extracted_price = parse_price(el.get_text())
+                    if extracted_price > 0.0:
                         break
-                if extracted_price > 0.0:
-                    break
 
+        # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
         in_stock = (extracted_price > 0.0) or has_buy_button
 
@@ -441,26 +428,36 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             notify = False
             alert_reason = ""
 
+            # Stok Alarmları
             if curr_stock and not prev_stock:
                 notify = True
                 alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
 
             elif curr_stock and curr_price > 0:
+                # Hedef Fiyat Alarmları
                 if target_price > 0 and curr_price <= target_price and prev_price > target_price:
                     notify = True
                     tag = " (♻️ İkinci El / Depo)" if is_used else ""
                     alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
                 
+                # Normal Fiyat Düşüş Alarmları (%80 sapma korumalı)
                 elif curr_price < prev_price and prev_price > 0:
-                    notify = True
-                    tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
-                    alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+                    drop_ratio = (prev_price - curr_price) / prev_price
+                    if drop_ratio > 0.80 and curr_price < 1000.0:
+                        logging.warning(f"Aşırı fiyat sapması tespit edildi, bildirim atlanıyor: {prev_price} -> {curr_price}")
+                        notify = False
+                    else:
+                        notify = True
+                        tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
+                        alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
+            # Kupon Alarmları
             if curr_stock and curr_coupon and not prev_coupon:
                 notify = True
                 coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>"
                 alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
 
+            # Fiyat Geçmişi Güncelleme
             history = info.get("history", [])
             if curr_price > 0 and (not history or history[-1] != curr_price):
                 history.append(curr_price)
