@@ -65,13 +65,14 @@ def resolve_url(url: str) -> str:
         return url
 
 def parse_price(price_str: str) -> float:
-    """Fiyat metnini sayıya çevirir."""
+    """Amazon TR fiyat formatlarını temiz float sayıya dönüştürür."""
     if not price_str:
         return 0.0
     try:
-        clean = re.sub(r"[^\d.,]", "", price_str).strip()
+        clean = re.sub(r"[^\d.,]", "", str(price_str)).strip()
         if not clean:
             return 0.0
+
         if "." in clean and "," in clean:
             clean = clean.replace(".", "").replace(",", ".")
         elif "," in clean:
@@ -80,6 +81,7 @@ def parse_price(price_str: str) -> float:
             parts = clean.split(".")
             if len(parts[-1]) == 3:
                 clean = clean.replace(".", "")
+
         return float(clean)
     except Exception:
         return 0.0
@@ -91,21 +93,13 @@ def scrape_amazon(raw_url: str):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "max-age=0",
-            "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1"
         }
 
-        # Deneme sırası: ScraperAPI Render'lı -> ScraperAPI Normal -> Direkt Bağlantı
         res = None
+        # 1. ScraperAPI İle Deneme
         if SCRAPER_KEY:
             try:
                 target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr&render=true"
@@ -121,6 +115,7 @@ def scrape_amazon(raw_url: str):
                 except Exception:
                     pass
 
+        # 2. Doğrudan Bağlantı Denemesi (Yedek)
         if not res or res.status_code != 200 or "productTitle" not in res.text:
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
@@ -133,7 +128,6 @@ def scrape_amazon(raw_url: str):
         soup = BeautifulSoup(res.text, "html.parser")
         html_text = res.text
 
-        # Amazon Captcha engeline takıldıysak
         if "enter the characters you see below" in html_text.lower() or "robot değilim" in html_text.lower():
             logging.warning("Amazon Captcha engeline takıldı!")
             return None
@@ -141,44 +135,40 @@ def scrape_amazon(raw_url: str):
         # 1. BAŞLIK ÇEKME
         title_el = soup.find("span", {"id": "productTitle"}) or soup.find("h1", {"id": "title"})
         if not title_el:
-            logging.warning("Ürün başlığı HTML içerisinde bulunamadı!")
             return None
         
         title = title_el.get_text(strip=True)
 
-        # 2. FİYAT ÇEKME
+        # 2. FİYAT ÇEKME (Taksit/Kupon Filtreli)
         extracted_price = 0.0
 
-        # JSON-LD kontrolü (Varsa doğrudan çeker)
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict) and "offers" in data:
-                    offers = data["offers"]
-                    if isinstance(offers, list): offers = offers[0]
-                    if "price" in offers:
-                        extracted_price = float(offers["price"])
-                        break
-            except Exception:
-                continue
+        buybox_selectors = [
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice"
+        ]
 
-        # HTML Elemanlarından Fiyat Bulma
+        for sel in buybox_selectors:
+            elements = soup.select(sel)
+            for el in elements:
+                p = parse_price(el.get_text())
+                if p > 500.0:  # 500 TL altı kupon/taksit tutarlarını elemek için
+                    extracted_price = p
+                    break
+            if extracted_price > 0:
+                break
+
         if extracted_price == 0.0:
-            price_selectors = [
-                "#corePrice_feature_div .a-offscreen",
-                "#corePriceDisplay_desktop_feature_div .a-offscreen",
-                "#apex_desktop .a-offscreen",
-                "#priceblock_ourprice",
-                "#priceblock_dealprice",
-                "span.a-price span.a-offscreen"
-            ]
-            for sel in price_selectors:
-                el = soup.select_one(sel)
-                if el:
-                    p = parse_price(el.get_text())
-                    if p > 10.0:
-                        extracted_price = p
-                        break
+            whole = soup.find("span", class_="a-price-whole")
+            fraction = soup.find("span", class_="a-price-fraction")
+            if whole:
+                w_str = whole.get_text(strip=True)
+                f_str = fraction.get_text(strip=True) if fraction else "00"
+                p = parse_price(f"{w_str},{f_str}")
+                if p > 0:
+                    extracted_price = p
 
         # 3. STOK KONTROLÜ
         out_keywords = ["şu anda stokta yok", "currently unavailable", "geçici olarak temin edilememektedir"]
