@@ -52,26 +52,32 @@ tracked_products = load_data()
 # ================= YARDIMCI FONKSİYONLAR =================
 
 def resolve_url(url: str) -> str:
-    """Kısa amzn.eu linklerini uzun Amazon ürün linkine dönüştürür."""
+    """Kısa amzn.eu / amazon.com.tr linklerini gerçek ürün linkine dönüştürür."""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
         }
         res = requests.head(url, allow_redirects=True, headers=headers, timeout=10)
         return res.url
-    except Exception as e:
-        logging.error(f"URL yönlendirme hatası: {e}")
+    except Exception:
         return url
 
+def extract_asin(url: str) -> str:
+    """Amazon linkinden ASIN kodunu çıkarır (Örn: B00X123456)."""
+    match = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})', url)
+    if match:
+        return match.group(1)
+    match_short = re.search(r'([A-Z0-9]{10})', url)
+    return match_short.group(1) if match_short else None
+
 def parse_price(price_str: str) -> float:
-    """Amazon TR fiyat formatlarını doğru float değere çevirir."""
+    """Fiyat metnini temiz float sayıya dönüştürür."""
     if not price_str:
         return 0.0
     try:
         clean = re.sub(r"[^\d.,]", "", price_str).strip()
         if not clean:
             return 0.0
-
         if "." in clean and "," in clean:
             clean = clean.replace(".", "").replace(",", ".")
         elif "," in clean:
@@ -80,118 +86,112 @@ def parse_price(price_str: str) -> float:
             parts = clean.split(".")
             if len(parts[-1]) == 3:
                 clean = clean.replace(".", "")
-
         return float(clean)
     except Exception:
         return 0.0
 
+def get_headers():
+    """Mobil cihaz gibi görünerek bot engelini aşan header seti."""
+    return {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
 def scrape_amazon(raw_url: str):
     try:
-        url = resolve_url(raw_url)
+        real_url = resolve_url(raw_url)
+        asin = extract_asin(real_url)
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Referer": "https://www.google.com/"
-        }
-
+        session = requests.Session()
+        
+        # ScraperAPI Varsa Kullan
         if SCRAPER_KEY:
-            target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(url)}&country_code=tr&render=true"
-            res = requests.get(target_url, timeout=35)
+            target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
+            res = session.get(target_url, timeout=30)
         else:
-            target_url = url
-            res = requests.get(target_url, headers=headers, timeout=20)
-        
+            res = session.get(real_url, headers=get_headers(), timeout=15)
+
         if res.status_code != 200:
-            logging.warning(f"Amazon Sayfası Yüklenemedi! Status: {res.status_code}")
+            logging.warning(f"HTTP Hatası: {res.status_code}")
             return None
 
         soup = BeautifulSoup(res.text, "html.parser")
-        page_text = res.text.lower()
+        html_content = res.text
 
-        # Amazon Captcha/Engelledi mi?
-        if "enter the characters you see below" in page_text or "robot değilim" in page_text:
-            logging.warning("Amazon Captcha engeline takılındı!")
-            return None
-
-        # Ürün Başlığı
-        title_el = soup.find("span", {"id": "productTitle"})
-        if not title_el:
-            # Başlık bulunamadıysa sayfa düzgün yüklenememiştir
-            return None
-            
-        title = title_el.get_text(strip=True)
-
-        # Doğrudan Ana Fiyat Kutularını (BuyBox) Hedefleme
+        # 1. YÖNTEM: JSON-LD Veri Katmanını Çek (Amazon'un En Güvenilir Yeri)
+        title = None
         extracted_price = 0.0
-        
-        main_price_containers = [
-            soup.find("div", {"id": "apex_desktop"}),
-            soup.find("div", {"id": "corePrice_feature_div"}),
-            soup.find("div", {"id": "corePriceDisplay_desktop_feature_div"}),
-            soup.find("div", {"id": "price"}),
-            soup.find("div", {"id": "buybox"})
-        ]
+        in_stock = False
 
-        for container in main_price_containers:
-            if not container:
+        json_ld_scripts = soup.find_all("script", type="application/ld+json")
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    if "name" in data and not title:
+                        title = data["name"]
+                    if "offers" in data:
+                        offers = data["offers"]
+                        if isinstance(offers, list):
+                            offers = offers[0]
+                        if "price" in offers:
+                            extracted_price = float(offers["price"])
+                        if "availability" in offers:
+                            in_stock = "InStock" in offers["availability"]
+            except Exception:
                 continue
 
-            # Üstü çizili fiyatları ve taksit alanlarını çıkar
-            for elem in container.find_all(["span", "div"], class_=["a-text-price", "a-size-small"]):
-                elem.decompose()
+        # 2. YÖNTEM: Başlık veya Fiyat JSON'dan Çıkmadıysa HTML Parsing
+        if not title:
+            title_el = soup.find("span", {"id": "productTitle"}) or soup.find("h1", {"id": "title"})
+            if title_el:
+                title = title_el.get_text(strip=True)
+            else:
+                title = "Amazon Ürünü"
 
-            offscreen = container.find("span", class_="a-offscreen")
-            if offscreen:
-                p_val = parse_price(offscreen.get_text())
-                if p_val > 10.0:  # Önemsiz çok küçük değerleri veya taksit kırıntılarını ele
-                    extracted_price = p_val
-                    break
-
-            whole = container.find("span", class_="a-price-whole")
-            fraction = container.find("span", class_="a-price-fraction")
-            if whole:
-                w_str = whole.get_text(strip=True)
-                f_str = fraction.get_text(strip=True) if fraction else "00"
-                p_val = parse_price(f"{w_str},{f_str}")
-                if p_val > 10.0:
-                    extracted_price = p_val
-                    break
-
-        # YEDEK: Fiyat bulunamadıysa genel a-price-whole araması yap
         if extracted_price == 0.0:
-            price_spans = soup.find_all("span", class_="a-offscreen")
-            for ps in price_spans:
-                p_val = parse_price(ps.get_text())
-                if p_val > 50.0:  # Mantıklı ürün fiyatı eşiği
-                    extracted_price = p_val
-                    break
+            # Sadece Ana Fiyat Alanlarına Bak
+            price_selectors = [
+                "#corePrice_feature_div .a-offscreen",
+                "#corePriceDisplay_desktop_feature_div .a-offscreen",
+                "#apex_desktop .a-offscreen",
+                "#priceblock_ourprice",
+                "#priceblock_dealprice",
+                "span.a-price span.a-offscreen"
+            ]
+            for selector in price_selectors:
+                el = soup.select_one(selector)
+                if el:
+                    p = parse_price(el.get_text())
+                    if p > 10.0:  # Taksit/küçük ekstraları ele
+                        extracted_price = p
+                        break
 
-        # Stok durumu kontrolü
-        out_keywords = [
-            "şu anda stokta yok", 
-            "geçici olarak temin edilememektedir", 
-            "currently unavailable",
-            "bu ürün şu anda mevcut değil"
-        ]
-        explicitly_out = any(kw in page_text for kw in out_keywords)
-
-        has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
+        # 3. YÖNTEM: Stok Kontrolü
+        out_keywords = ["şu anda stokta yok", "currently unavailable", "geçici olarak temin edilememektedir"]
+        is_out = any(kw in html_content.lower() for kw in out_keywords)
+        
+        has_buy_button = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
                          (soup.find("input", {"id": "buy-now-button"}) is not None) or \
-                         (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None) or \
                          (soup.find("span", {"id": "submit.add-to-cart"}) is not None)
 
-        in_stock = not explicitly_out and (has_add_to_cart or extracted_price > 0)
+        if not is_out and (has_buy_button or extracted_price > 0):
+            in_stock = True
+        else:
+            in_stock = False
 
         return {
             "title": title[:45] + "..." if len(title) > 45 else title,
             "price": extracted_price,
             "in_stock": in_stock,
-            "real_url": url
+            "real_url": real_url
         }
     except Exception as e:
-        logging.error(f"Scraping hatası ({raw_url}): {e}")
+        logging.error(f"Scraping Hatası ({raw_url}): {e}")
         return None
 
 def is_authorized(update: Update) -> bool:
@@ -241,7 +241,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = scrape_amazon(url)
 
     if not data:
-        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Amazon bot engeli uygulamış olabilir, lütfen 1-2 dakika sonra tekrar deneyin.")
+        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Lütfen linki kontrol edip tekrar deneyin.")
         return
 
     real_url = data["real_url"]
