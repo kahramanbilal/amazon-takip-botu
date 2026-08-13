@@ -51,23 +51,32 @@ tracked_products = load_data()
 
 # ================= YARDIMCI FONKSİYONLAR =================
 
+def resolve_url(url: str) -> str:
+    """Kısa amzn.eu linklerini uzun Amazon ürün linkine dönüştürür."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        res = requests.head(url, allow_redirects=True, headers=headers, timeout=10)
+        return res.url
+    except Exception as e:
+        logging.error(f"URL yönlendirme hatası: {e}")
+        return url
+
 def parse_price(price_str: str) -> float:
-    """Amazon TR fiyat formatlarını (örn: 1.299,00 TL, 450,50 ₺) doğru float değere çevirir."""
+    """Amazon TR fiyat formatlarını doğru float değere çevirir."""
     if not price_str:
         return 0.0
     try:
-        # Sadece rakam, nokta ve virgülü tut
         clean = re.sub(r"[^\d.,]", "", price_str).strip()
         if not clean:
             return 0.0
 
-        # Binlik ayrıcı olan noktayı kaldır, kuruş ayırıcı olan virgülü noktaya çevir
         if "." in clean and "," in clean:
             clean = clean.replace(".", "").replace(",", ".")
         elif "," in clean:
             clean = clean.replace(",", ".")
         elif "." in clean:
-            # 1.499 gibi durumlarda binlik noktası ise kaldır
             parts = clean.split(".")
             if len(parts[-1]) == 3:
                 clean = clean.replace(".", "")
@@ -76,19 +85,23 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-def scrape_amazon(url: str):
+def scrape_amazon(raw_url: str):
     try:
+        url = resolve_url(raw_url)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.google.com/"
+        }
+
         if SCRAPER_KEY:
-            target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={url}&country_code=tr"
-            headers = {}
+            target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(url)}&country_code=tr&render=true"
+            res = requests.get(target_url, timeout=35)
         else:
             target_url = url
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept-Language": "tr-TR,tr;q=0.9"
-            }
-
-        res = requests.get(target_url, headers=headers, timeout=30)
+            res = requests.get(target_url, headers=headers, timeout=20)
         
         if res.status_code != 200:
             logging.warning(f"Amazon Sayfası Yüklenemedi! Status: {res.status_code}")
@@ -97,23 +110,22 @@ def scrape_amazon(url: str):
         soup = BeautifulSoup(res.text, "html.parser")
         page_text = res.text.lower()
 
+        # Amazon Captcha/Engelledi mi?
+        if "enter the characters you see below" in page_text or "robot değilim" in page_text:
+            logging.warning("Amazon Captcha engeline takılındı!")
+            return None
+
         # Ürün Başlığı
         title_el = soup.find("span", {"id": "productTitle"})
-        title = title_el.get_text(strip=True) if title_el else "Amazon Ürünü"
-
-        # Stoksuzluk Durum Kontrolü
-        out_keywords = [
-            "şu anda stokta yok", 
-            "geçici olarak temin edilememektedir", 
-            "currently unavailable",
-            "bu ürün şu anda mevcut değil"
-        ]
-        explicitly_out = any(kw in page_text for kw in out_keywords)
+        if not title_el:
+            # Başlık bulunamadıysa sayfa düzgün yüklenememiştir
+            return None
+            
+        title = title_el.get_text(strip=True)
 
         # Doğrudan Ana Fiyat Kutularını (BuyBox) Hedefleme
         extracted_price = 0.0
         
-        # 1. Öncelik: Ana Fiyat Kutusu (Apex/CorePrice)
         main_price_containers = [
             soup.find("div", {"id": "apex_desktop"}),
             soup.find("div", {"id": "corePrice_feature_div"}),
@@ -126,45 +138,49 @@ def scrape_amazon(url: str):
             if not container:
                 continue
 
-            # Üstü çizili eski fiyatları hariç tut
-            strikethrough = container.find("span", class_="a-text-price")
-            if strikethrough:
-                strikethrough.decompose()
+            # Üstü çizili fiyatları ve taksit alanlarını çıkar
+            for elem in container.find_all(["span", "div"], class_=["a-text-price", "a-size-small"]):
+                elem.decompose()
 
-            # Gizli veya ekran okuyucu ana fiyat
             offscreen = container.find("span", class_="a-offscreen")
             if offscreen:
                 p_val = parse_price(offscreen.get_text())
-                if p_val > 0:
+                if p_val > 10.0:  # Önemsiz çok küçük değerleri veya taksit kırıntılarını ele
                     extracted_price = p_val
                     break
 
-            # Parçalı fiyat (Whole + Fraction)
             whole = container.find("span", class_="a-price-whole")
             fraction = container.find("span", class_="a-price-fraction")
             if whole:
                 w_str = whole.get_text(strip=True)
                 f_str = fraction.get_text(strip=True) if fraction else "00"
                 p_val = parse_price(f"{w_str},{f_str}")
-                if p_val > 0:
+                if p_val > 10.0:
                     extracted_price = p_val
                     break
 
-        # 2. Öncelik: Diğer Satıcılar Kutusu (MBBOX)
+        # YEDEK: Fiyat bulunamadıysa genel a-price-whole araması yap
         if extracted_price == 0.0:
-            mbc = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
-            if mbc:
-                p_spans = mbc.find_all("span", class_="a-color-price")
-                for ps in p_spans:
-                    p_val = parse_price(ps.get_text())
-                    if p_val > 0:
-                        extracted_price = p_val
-                        break
+            price_spans = soup.find_all("span", class_="a-offscreen")
+            for ps in price_spans:
+                p_val = parse_price(ps.get_text())
+                if p_val > 50.0:  # Mantıklı ürün fiyatı eşiği
+                    extracted_price = p_val
+                    break
 
-        # Stok durumu kararı
+        # Stok durumu kontrolü
+        out_keywords = [
+            "şu anda stokta yok", 
+            "geçici olarak temin edilememektedir", 
+            "currently unavailable",
+            "bu ürün şu anda mevcut değil"
+        ]
+        explicitly_out = any(kw in page_text for kw in out_keywords)
+
         has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
                          (soup.find("input", {"id": "buy-now-button"}) is not None) or \
-                         (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
+                         (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None) or \
+                         (soup.find("span", {"id": "submit.add-to-cart"}) is not None)
 
         in_stock = not explicitly_out and (has_add_to_cart or extracted_price > 0)
 
@@ -175,7 +191,7 @@ def scrape_amazon(url: str):
             "real_url": url
         }
     except Exception as e:
-        logging.error(f"Scraping hatası ({url}): {e}")
+        logging.error(f"Scraping hatası ({raw_url}): {e}")
         return None
 
 def is_authorized(update: Update) -> bool:
@@ -209,7 +225,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         url = context.args[0]
-        if len(context.args) > 1 and context.args[1].replace(".", "", 1).replace(",", "", 1).isdigit():
+        if len(context.args) > 1:
             target_price = parse_price(context.args[1])
     elif update.message.text and "http" in update.message.text:
         parts = update.message.text.strip().split()
@@ -225,7 +241,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = scrape_amazon(url)
 
     if not data:
-        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Lütfen linki kontrol edip tekrar deneyin.")
+        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Amazon bot engeli uygulamış olabilir, lütfen 1-2 dakika sonra tekrar deneyin.")
         return
 
     real_url = data["real_url"]
