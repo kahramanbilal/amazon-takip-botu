@@ -52,11 +52,26 @@ tracked_products = load_data()
 # ================= YARDIMCI FONKSİYONLAR =================
 
 def parse_price(price_str: str) -> float:
+    """Amazon TR fiyat formatlarını (örn: 1.299,00 TL, 450,50 ₺) doğru float değere çevirir."""
     if not price_str:
         return 0.0
     try:
-        clean = re.sub(r"[^\d,]", "", price_str)
-        clean = clean.replace(",", ".")
+        # Sadece rakam, nokta ve virgülü tut
+        clean = re.sub(r"[^\d.,]", "", price_str).strip()
+        if not clean:
+            return 0.0
+
+        # Binlik ayrıcı olan noktayı kaldır, kuruş ayırıcı olan virgülü noktaya çevir
+        if "." in clean and "," in clean:
+            clean = clean.replace(".", "").replace(",", ".")
+        elif "," in clean:
+            clean = clean.replace(",", ".")
+        elif "." in clean:
+            # 1.499 gibi durumlarda binlik noktası ise kaldır
+            parts = clean.split(".")
+            if len(parts[-1]) == 3:
+                clean = clean.replace(".", "")
+
         return float(clean)
     except Exception:
         return 0.0
@@ -82,46 +97,80 @@ def scrape_amazon(url: str):
         soup = BeautifulSoup(res.text, "html.parser")
         page_text = res.text.lower()
 
+        # Ürün Başlığı
         title_el = soup.find("span", {"id": "productTitle"})
         title = title_el.get_text(strip=True) if title_el else "Amazon Ürünü"
 
-        prices = []
-        price_span = soup.find("span", class_="a-price")
-        if price_span:
-            offscreen = price_span.find("span", class_="a-offscreen")
-            if offscreen:
-                prices.append(parse_price(offscreen.get_text()))
-
-        core_price = soup.find("span", {"id": "priceblock_ourprice"}) or soup.find("span", {"id": "priceblock_dealprice"})
-        if core_price:
-            prices.append(parse_price(core_price.get_text()))
-
-        other_sellers_box = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
-        if other_sellers_box:
-            other_prices = other_sellers_box.find_all("span", class_="a-color-price")
-            for p in other_prices:
-                prices.append(parse_price(p.get_text()))
-
-        valid_prices = [p for p in prices if p > 0]
-        lowest_price = min(valid_prices) if valid_prices else 0.0
-
+        # Stoksuzluk Durum Kontrolü
         out_keywords = [
             "şu anda stokta yok", 
             "geçici olarak temin edilememektedir", 
             "currently unavailable",
             "bu ürün şu anda mevcut değil"
         ]
-        
         explicitly_out = any(kw in page_text for kw in out_keywords)
+
+        # Doğrudan Ana Fiyat Kutularını (BuyBox) Hedefleme
+        extracted_price = 0.0
+        
+        # 1. Öncelik: Ana Fiyat Kutusu (Apex/CorePrice)
+        main_price_containers = [
+            soup.find("div", {"id": "apex_desktop"}),
+            soup.find("div", {"id": "corePrice_feature_div"}),
+            soup.find("div", {"id": "corePriceDisplay_desktop_feature_div"}),
+            soup.find("div", {"id": "price"}),
+            soup.find("div", {"id": "buybox"})
+        ]
+
+        for container in main_price_containers:
+            if not container:
+                continue
+
+            # Üstü çizili eski fiyatları hariç tut
+            strikethrough = container.find("span", class_="a-text-price")
+            if strikethrough:
+                strikethrough.decompose()
+
+            # Gizli veya ekran okuyucu ana fiyat
+            offscreen = container.find("span", class_="a-offscreen")
+            if offscreen:
+                p_val = parse_price(offscreen.get_text())
+                if p_val > 0:
+                    extracted_price = p_val
+                    break
+
+            # Parçalı fiyat (Whole + Fraction)
+            whole = container.find("span", class_="a-price-whole")
+            fraction = container.find("span", class_="a-price-fraction")
+            if whole:
+                w_str = whole.get_text(strip=True)
+                f_str = fraction.get_text(strip=True) if fraction else "00"
+                p_val = parse_price(f"{w_str},{f_str}")
+                if p_val > 0:
+                    extracted_price = p_val
+                    break
+
+        # 2. Öncelik: Diğer Satıcılar Kutusu (MBBOX)
+        if extracted_price == 0.0:
+            mbc = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
+            if mbc:
+                p_spans = mbc.find_all("span", class_="a-color-price")
+                for ps in p_spans:
+                    p_val = parse_price(ps.get_text())
+                    if p_val > 0:
+                        extracted_price = p_val
+                        break
+
+        # Stok durumu kararı
         has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
                          (soup.find("input", {"id": "buy-now-button"}) is not None) or \
                          (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
 
-        in_stock = not explicitly_out and (has_add_to_cart or lowest_price > 0)
+        in_stock = not explicitly_out and (has_add_to_cart or extracted_price > 0)
 
         return {
-            "title": title[:40] + "..." if len(title) > 40 else title,
-            "price": lowest_price,
+            "title": title[:45] + "..." if len(title) > 45 else title,
+            "price": extracted_price,
             "in_stock": in_stock,
             "real_url": url
         }
@@ -160,13 +209,13 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         url = context.args[0]
-        if len(context.args) > 1 and context.args[1].replace(".", "", 1).isdigit():
-            target_price = float(context.args[1])
+        if len(context.args) > 1 and context.args[1].replace(".", "", 1).replace(",", "", 1).isdigit():
+            target_price = parse_price(context.args[1])
     elif update.message.text and "http" in update.message.text:
         parts = update.message.text.strip().split()
         url = parts[0]
-        if len(parts) > 1 and parts[1].replace(".", "", 1).isdigit():
-            target_price = float(parts[1])
+        if len(parts) > 1:
+            target_price = parse_price(parts[1])
 
     if not url or ("amazon" not in url.lower() and "amzn" not in url.lower()):
         await update.message.reply_text("❌ Lütfen geçerli bir Amazon ürün linki girin.")
