@@ -20,28 +20,32 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 TOKEN = os.environ.get("TELEGRAMTOKEN")
 CHAT_ID_ENV = os.environ.get("CHATID")
 SCRAPER_KEY = os.environ.get("SCRAPER_KEY")
+NPOINT_ID = os.environ.get("NPOINT_ID")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
-DATA_FILE = "tracked_products.json"
 
-# ================= VERİ TABANI YÖNETİMİ =================
+# ================= BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
 
 def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Veri yükleme hatası: {e}")
-            return {}
+    if not NPOINT_ID:
+        logging.warning("NPOINT_ID değişkeni bulunamadı. Veriler geçici hafızada saklanacak.")
+        return {}
+    try:
+        res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.error(f"NPoint yükleme hatası: {e}")
     return {}
 
 def save_data(data: dict):
+    if not NPOINT_ID:
+        return
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        requests.post(f"https://api.npoint.io/{NPOINT_ID}", json=data, timeout=10)
     except Exception as e:
-        logging.error(f"Veri kaydetme hatası: {e}")
+        logging.error(f"NPoint kaydetme hatası: {e}")
 
 tracked_products = load_data()
 
@@ -59,7 +63,6 @@ def parse_price(price_str: str) -> float:
 
 def scrape_amazon(url: str):
     try:
-        # Eğer ScraperAPI key girilmişse isteği proxy üzerinden geçir
         if SCRAPER_KEY:
             target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={url}&country_code=tr"
             headers = {}
@@ -79,26 +82,20 @@ def scrape_amazon(url: str):
         soup = BeautifulSoup(res.text, "html.parser")
         page_text = res.text.lower()
 
-        # Ürün Başlığı
         title_el = soup.find("span", {"id": "productTitle"})
         title = title_el.get_text(strip=True) if title_el else "Amazon Ürünü"
 
-        # Fiyat Analizi
         prices = []
-        
-        # 1. Ana Fiyat
         price_span = soup.find("span", class_="a-price")
         if price_span:
             offscreen = price_span.find("span", class_="a-offscreen")
             if offscreen:
                 prices.append(parse_price(offscreen.get_text()))
 
-        # 2. Apex / Core Price
         core_price = soup.find("span", {"id": "priceblock_ourprice"}) or soup.find("span", {"id": "priceblock_dealprice"})
         if core_price:
             prices.append(parse_price(core_price.get_text()))
 
-        # 3. Diğer Satıcılar Fiyatı
         other_sellers_box = soup.find("div", {"id": "mbc"}) or soup.find("div", {"id": "moreBuyingChoices_feature_div"})
         if other_sellers_box:
             other_prices = other_sellers_box.find_all("span", class_="a-color-price")
@@ -108,7 +105,6 @@ def scrape_amazon(url: str):
         valid_prices = [p for p in prices if p > 0]
         lowest_price = min(valid_prices) if valid_prices else 0.0
 
-        # Stok Durumu Kontrolü
         out_keywords = [
             "şu anda stokta yok", 
             "geçici olarak temin edilememektedir", 
@@ -117,7 +113,6 @@ def scrape_amazon(url: str):
         ]
         
         explicitly_out = any(kw in page_text for kw in out_keywords)
-        
         has_add_to_cart = (soup.find("input", {"id": "add-to-cart-button"}) is not None) or \
                          (soup.find("input", {"id": "buy-now-button"}) is not None) or \
                          (soup.find("a", {"id": "buybox-see-all-buying-choices"}) is not None)
@@ -208,6 +203,9 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
+    global tracked_products
+    tracked_products = load_data()
+
     if not tracked_products:
         await update.message.reply_text("📋 Şu anda takip edilen hiç ürün yok.")
         return
@@ -250,6 +248,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= ARKA PLAN TARAMA GÖREVİ =================
 
 async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
+    global tracked_products
+    tracked_products = load_data()
+
     if not tracked_products or not ALLOWED_CHAT_ID:
         return
 
