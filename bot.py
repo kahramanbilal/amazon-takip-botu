@@ -93,7 +93,7 @@ def resolve_url(url: str) -> str:
         return url
 
 def parse_price(price_str: str) -> float:
-    """Tüm yerel ve küresel para birimi formatlarını hatasız ayrıştıran gelişmiş fonksiyon."""
+    """Tüm yerel ve küresel para birimi formatlarını hatasız ayrıştıran fonksiyon."""
     if not price_str:
         return 0.0
     try:
@@ -126,17 +126,29 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= TAM ZIRHLI AMAZON SCRAPER =================
+# ================= TAM ZIRHLI & VARYASYON KORUMALI AMAZON SCRAPER =================
 
 def extract_price_from_soup(soup) -> float:
-    """Amazon HTML'inden doğrudan bütünleşmiş fiyat tespiti yapar."""
-    # 1. Öncelik: Amazon'un Parçalı HTML Yapısı (a-price-whole + a-price-fraction)
-    # Bu yöntem basamak/virgül kaymalarını tamamen engeller.
+    """Diğer renk/boyut varyasyonlarını silip YALNIZCA seçili ürünün ana fiyatını çeker."""
+    
+    # 1. ADIM: Sayfadaki diğer renk/boyut seçeneklerinin (Mavi, Siyah vb.) kutularını HTML'den sil
+    variation_selectors = [
+        "#twister", 
+        "#variation_color_name", 
+        "#variation_size_name", 
+        "#variation_style_name", 
+        ".twister-plus-inline-twister", 
+        "#inline-twister-row-color_name"
+    ]
+    for v_sel in variation_selectors:
+        for match in soup.select(v_sel):
+            match.decompose()
+
+    # 2. ADIM: Seçili ürünün Ana Fiyatını Okuma (a-price-whole + a-price-fraction)
     price_containers = [
         "#corePrice_feature_div .a-price",
         "#corePriceDisplay_desktop_feature_div .a-price",
-        "#apex_desktop .a-price",
-        ".a-price"
+        "#apex_desktop .a-price"
     ]
 
     for container in price_containers:
@@ -151,15 +163,13 @@ def extract_price_from_soup(soup) -> float:
                     if p_val > 0.0:
                         return p_val
 
-    # 2. Öncelik: Standart Fiyat Kutuları (a-offscreen)
+    # 3. ADIM: Alternatif Ana Fiyat Kutusu
     selectors = [
         "#corePrice_feature_div .a-price .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
         "#apex_desktop .a-price .a-offscreen",
-        "#booksHeaderSection .a-price .a-offscreen",
         "#price_inside_buybox",
-        "#priceblock_ourprice",
-        "#priceblock_dealprice"
+        "#priceblock_ourprice"
     ]
 
     for sel in selectors:
@@ -169,14 +179,7 @@ def extract_price_from_soup(soup) -> float:
             if p > 0.0:
                 return p
 
-    # 3. Öncelik: Fallback (Bulunan tüm geçerli fiyatların maksimumunu seç - Taksitleri elemek için)
-    all_prices = []
-    for el in soup.select(".a-price .a-offscreen"):
-        p = parse_price(el.get_text())
-        if p > 0.0:
-            all_prices.append(p)
-
-    return max(all_prices) if all_prices else 0.0
+    return 0.0
 
 
 def scrape_amazon(raw_url: str):
@@ -512,7 +515,6 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                 
                 elif curr_price < prev_price and prev_price > 0:
                     drop_ratio = (prev_price - curr_price) / prev_price
-                    # %80 üzerindeki hatalı anlık düşüşlerde saçma bildirimleri engelleme
                     if drop_ratio > 0.80 and curr_price < 1000.0:
                         logging.warning(f"Aşırı fiyat sapması tespit edildi: {prev_price} -> {curr_price}")
                         notify = False
