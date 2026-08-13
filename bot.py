@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import asyncio
 import requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -76,7 +77,7 @@ tracked_products = load_data()
 
 def get_tr_time() -> str:
     tr_tz = timezone(timedelta(hours=3))
-    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylul", "Ekim", "Kasım", "Aralık"]
     now = datetime.now(tr_tz)
     return f"{now.day} {months[now.month - 1]} {now.strftime('%H:%M')}"
 
@@ -93,7 +94,6 @@ def resolve_url(url: str) -> str:
         return url
 
 def parse_price(price_str: str) -> float:
-    """Tüm yerel ve küresel para birimi formatlarını hatasız ayrıştıran fonksiyon."""
     if not price_str:
         return 0.0
     try:
@@ -103,10 +103,8 @@ def parse_price(price_str: str) -> float:
 
         if "." in clean and "," in clean:
             if clean.rfind(",") > clean.rfind("."):
-                # TR Formatı: 15.199,00 -> 15199.00
                 clean = clean.replace(".", "").replace(",", ".")
             else:
-                # EN Formatı: 15,199.00 -> 15199.00
                 clean = clean.replace(",", "")
         elif "," in clean:
             parts = clean.split(",")
@@ -129,9 +127,6 @@ def parse_price(price_str: str) -> float:
 # ================= TAM ZIRHLI & VARYASYON KORUMALI AMAZON SCRAPER =================
 
 def extract_price_from_soup(soup) -> float:
-    """Diğer renk/boyut varyasyonlarını silip YALNIZCA seçili ürünün ana fiyatını çeker."""
-    
-    # 1. ADIM: Sayfadaki diğer renk/boyut seçeneklerinin (Mavi, Siyah vb.) kutularını HTML'den sil
     variation_selectors = [
         "#twister", 
         "#variation_color_name", 
@@ -144,7 +139,6 @@ def extract_price_from_soup(soup) -> float:
         for match in soup.select(v_sel):
             match.decompose()
 
-    # 2. ADIM: Seçili ürünün Ana Fiyatını Okuma (a-price-whole + a-price-fraction)
     price_containers = [
         "#corePrice_feature_div .a-price",
         "#corePriceDisplay_desktop_feature_div .a-price",
@@ -163,7 +157,6 @@ def extract_price_from_soup(soup) -> float:
                     if p_val > 0.0:
                         return p_val
 
-    # 3. ADIM: Alternatif Ana Fiyat Kutusu
     selectors = [
         "#corePrice_feature_div .a-price .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
@@ -196,7 +189,7 @@ def scrape_amazon(raw_url: str):
         if SCRAPER_KEY:
             try:
                 target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr&render=true"
-                res = requests.get(target_url, timeout=25)
+                res = requests.get(target_url, timeout=20)
             except Exception:
                 pass
 
@@ -204,7 +197,7 @@ def scrape_amazon(raw_url: str):
             if SCRAPER_KEY:
                 try:
                     target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
-                    res = requests.get(target_url, timeout=20)
+                    res = requests.get(target_url, timeout=15)
                 except Exception:
                     pass
 
@@ -229,7 +222,6 @@ def scrape_amazon(raw_url: str):
         title = title_el.get_text(strip=True)
         extracted_price = extract_price_from_soup(soup)
 
-        # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
         in_stock = (extracted_price > 0.0) or has_buy_button
 
@@ -300,7 +292,9 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = await update.message.reply_text("🔍 Ürün taranıyor...")
-    data = scrape_amazon(url)
+    
+    # Kilitlenmeyi önlemek için asyncio.to_thread eklendi
+    data = await asyncio.to_thread(scrape_amazon, url)
 
     if not data:
         await msg.edit_text("❌ Ürün bilgileri çekilemedi. Lütfen biraz sonra tekrar deneyin.")
@@ -319,7 +313,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_check": now_tr,
         "history": history
     }
-    save_data(tracked_products)
+    await asyncio.to_thread(save_data, tracked_products)
 
     status_str = f"✅ Stokta ({data['price']:.2f} TL)" if data["in_stock"] else "❌ Stokta Yok"
     target_str = f"\n🎯 <b>Hedef Fiyat:</b> {target_price:.2f} TL" if target_price > 0 else ""
@@ -338,7 +332,7 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global tracked_products
-    fresh_data = load_data()
+    fresh_data = await asyncio.to_thread(load_data)
     if fresh_data:
         tracked_products = fresh_data
 
@@ -381,7 +375,8 @@ async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(f"⚡ <b>{product['title']}</b> için canlı fiyat sorgulanıyor...", parse_mode="HTML")
     
-    current_data = scrape_amazon(target_url)
+    # Kilitlenmeyi önlemek için asyncio.to_thread eklendi
+    current_data = await asyncio.to_thread(scrape_amazon, target_url)
     now_tr = get_tr_time()
 
     if not current_data:
@@ -392,7 +387,7 @@ async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked_products[target_url]["in_stock"] = current_data["in_stock"]
     tracked_products[target_url]["has_coupon"] = current_data["has_coupon"]
     tracked_products[target_url]["last_check"] = now_tr
-    save_data(tracked_products)
+    await asyncio.to_thread(save_data, tracked_products)
 
     stok_str = f"✅ {current_data['price']:.2f} TL" if current_data["in_stock"] else "❌ Stokta Yok"
 
@@ -459,7 +454,7 @@ async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_url = urls[index]
     removed_item = tracked_products.pop(target_url)
-    save_data(tracked_products)
+    await asyncio.to_thread(save_data, tracked_products)
     await update.message.reply_text(f"🗑 <b>{removed_item['title']}</b> silindi.", parse_mode="HTML")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,7 +468,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
     global tracked_products
     try:
-        fresh_data = load_data()
+        fresh_data = await asyncio.to_thread(load_data)
         if fresh_data:
             tracked_products = fresh_data
 
@@ -484,7 +479,8 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         now_tr = get_tr_time()
 
         for url, info in list(tracked_products.items()):
-            current_data = scrape_amazon(url)
+            # Botun kilitlenmesini kesin olarak önleyen async devretme
+            current_data = await asyncio.to_thread(scrape_amazon, url)
             
             if not current_data:
                 logging.warning(f"Ürün verisi çekilemedi: {url}")
@@ -554,7 +550,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.error(f"Bildirim hatası: {e}")
 
         if updated:
-            save_data(tracked_products)
+            await asyncio.to_thread(save_data, tracked_products)
     except Exception as e:
         logging.error(f"Arka plan görevi hatası: {e}")
 
