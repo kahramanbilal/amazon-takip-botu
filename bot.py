@@ -77,7 +77,7 @@ tracked_products = load_data()
 
 def get_tr_time() -> str:
     tr_tz = timezone(timedelta(hours=3))
-    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylul", "Ekim", "Kasım", "Aralık"]
+    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
     now = datetime.now(tr_tz)
     return f"{now.day} {months[now.month - 1]} {now.strftime('%H:%M')}"
 
@@ -124,7 +124,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= TAM ZIRHLI & VARYASYON KORUMALI AMAZON SCRAPER =================
+# ================= KREDİ TASARRUFLU AMAZON SCRAPER =================
 
 def extract_price_from_soup(soup) -> float:
     variation_selectors = [
@@ -186,25 +186,24 @@ def scrape_amazon(raw_url: str):
         }
 
         res = None
-        if SCRAPER_KEY:
-            try:
-                target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr&render=true"
-                res = requests.get(target_url, timeout=20)
-            except Exception:
-                pass
 
+        # 1. ÖNCELİK: Doğrudan Ücretsiz İstek (Kredi Harcamaz)
+        try:
+            session = requests.Session()
+            session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
+            res = session.get(real_url, headers=headers, timeout=10)
+        except Exception:
+            pass
+
+        # 2. ÖNCELİK: Yalnızca İlk İstek Başarısız Olursa ScraperAPI Kullan (Tek Kredilik Mod)
         if not res or res.status_code != 200 or "productTitle" not in res.text:
             if SCRAPER_KEY:
                 try:
+                    # render=true kaldırıldı: 5-10 kredi yerine sadece 1 kredi harcar
                     target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
                     res = requests.get(target_url, timeout=15)
                 except Exception:
                     pass
-
-        if not res or res.status_code != 200 or "productTitle" not in res.text:
-            session = requests.Session()
-            session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
-            res = session.get(real_url, headers=headers, timeout=12)
 
         if not res or res.status_code != 200:
             return None
@@ -292,8 +291,6 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = await update.message.reply_text("🔍 Ürün taranıyor...")
-    
-    # Kilitlenmeyi önlemek için asyncio.to_thread eklendi
     data = await asyncio.to_thread(scrape_amazon, url)
 
     if not data:
@@ -375,7 +372,6 @@ async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(f"⚡ <b>{product['title']}</b> için canlı fiyat sorgulanıyor...", parse_mode="HTML")
     
-    # Kilitlenmeyi önlemek için asyncio.to_thread eklendi
     current_data = await asyncio.to_thread(scrape_amazon, target_url)
     now_tr = get_tr_time()
 
@@ -479,7 +475,6 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
         now_tr = get_tr_time()
 
         for url, info in list(tracked_products.items()):
-            # Botun kilitlenmesini kesin olarak önleyen async devretme
             current_data = await asyncio.to_thread(scrape_amazon, url)
             
             if not current_data:
@@ -574,6 +569,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
     if app.job_queue:
+        # 10 Dakika (600 saniye) sıklık aynen korundu!
         app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
     else:
         logging.warning("JobQueue yüklenemedi! 'pip install python-telegram-bot[job-queue]' çalıştırın.")
