@@ -25,7 +25,7 @@ NPOINT_ID = os.environ.get("NPOINT_ID")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
 
-# ================= BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
+# ================= BULUT VERİ TABANI YÖNETİMİ =================
 
 def load_data() -> dict:
     if not NPOINT_ID:
@@ -106,7 +106,7 @@ def scrape_amazon(raw_url: str):
         if SCRAPER_KEY:
             try:
                 target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr&render=true"
-                res = requests.get(target_url, timeout=35)
+                res = requests.get(target_url, timeout=25)
             except Exception:
                 pass
 
@@ -114,14 +114,14 @@ def scrape_amazon(raw_url: str):
             if SCRAPER_KEY:
                 try:
                     target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
-                    res = requests.get(target_url, timeout=25)
+                    res = requests.get(target_url, timeout=20)
                 except Exception:
                     pass
 
         if not res or res.status_code != 200 or "productTitle" not in res.text:
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
-            res = session.get(real_url, headers=headers, timeout=15)
+            res = session.get(real_url, headers=headers, timeout=12)
 
         if not res or res.status_code != 200:
             return None
@@ -137,10 +137,8 @@ def scrape_amazon(raw_url: str):
             return None
         
         title = title_el.get_text(strip=True)
-
         extracted_price = 0.0
 
-        # Birincil Fiyat Blokları (Sadece ana ürün fiyatının yer aldığı alanlar)
         primary_selectors = [
             "#corePrice_feature_div .a-price .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
@@ -155,11 +153,10 @@ def scrape_amazon(raw_url: str):
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
-                if p > 100.0:  # Taksit/Kargo gibi küçük sayıları filtresiz almamak için eşik
+                if p > 100.0:
                     extracted_price = p
                     break
 
-        # Eğer birincil bloklarda bulunamadıysa ikincil alanları tara
         if extracted_price == 0.0:
             secondary_selectors = [
                 "#usedAccordion .a-price .a-offscreen",
@@ -176,7 +173,6 @@ def scrape_amazon(raw_url: str):
                 if extracted_price > 0.0:
                     break
 
-        # Stok Durumu Kontrolü
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
         in_stock = (extracted_price > 0.0) or has_buy_button
 
@@ -212,15 +208,14 @@ def is_authorized(update: Update) -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-
     welcome_text = (
         "🤖 <b>Amazon Stok & Fiyat Takip Botu Pro!</b>\n\n"
         "<b>Komutlar:</b>\n"
         "▫️ `/ekle [link] [hedef_fiyat]` - Takip ekler\n"
-        "▫️ `/liste` - Takip edilen ürünleri ve son tarama zamanını gösterir\n"
-        "▫️ `/fiyat [sıra_no]` - Seçilen ürünün canlı anlık fiyatını çeker\n"
-        "▫️ `/tara` - Tüm ürünler için anında tarama başlatır\n"
-        "▫️ `/gecmis [sıra_no]` - Ürünün fiyat geçmişini gösterir\n"
+        "▫️ `/liste` - Takip edilen ürünleri gösterir\n"
+        "▫️ `/fiyat [sıra_no]` - Canlı anlık fiyatı çeker\n"
+        "▫️ `/tara` - Anında tüm ürünleri tarar\n"
+        "▫️ `/gecmis [sıra_no]` - Fiyat geçmişini gösterir\n"
         "▫️ `/sil [sıra_no]` - Listeden ürün çıkarır\n"
         "▫️ `/durum` - Sistem durumunu raporlar\n"
     )
@@ -237,7 +232,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = context.args[0]
         if len(context.args) > 1:
             target_price = parse_price(context.args[1])
-    elif update.message.text and "http" in update.message.text:
+    elif update.message and update.message.text and "http" in update.message.text:
         parts = update.message.text.strip().split()
         url = parts[0]
         if len(parts) > 1:
@@ -414,91 +409,87 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = len(tracked_products)
     await update.message.reply_text(f"⚡ Bot aktif! Toplam Takip Edilen Ürün: <b>{count}</b>", parse_mode="HTML")
 
-# ================= ARKA PLAN TARAMA GÖREVİ (STOK SPAM KORUMALI) =================
+# ================= ARKA PLAN TARAMA GÖREVİ =================
 
 async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
     global tracked_products
-    tracked_products = load_data()
+    try:
+        tracked_products = load_data()
+        if not tracked_products or not ALLOWED_CHAT_ID:
+            return
 
-    if not tracked_products or not ALLOWED_CHAT_ID:
-        return
+        updated = False
+        now_tr = get_tr_time()
 
-    updated = False
-    now_tr = get_tr_time()
-
-    for url, info in list(tracked_products.items()):
-        current_data = scrape_amazon(url)
-        
-        # BAĞLANTI / ENGEL HATASI: Tarama başarısızsa ürünün mevcut durumunu koru!
-        if not current_data:
-            logging.warning(f"Ürün verisi çekilemedi, eski durum korunuyor: {url}")
-            continue
-
-        prev_stock = info.get("in_stock", True)
-        prev_price = info.get("last_price", 0.0)
-        prev_coupon = info.get("has_coupon", False)
-        target_price = info.get("target_price", 0.0)
-
-        curr_stock = current_data["in_stock"]
-        curr_price = current_data["price"]
-        curr_coupon = current_data["has_coupon"]
-        is_used = current_data.get("is_used", False)
-
-        notify = False
-        alert_reason = ""
-
-        # KESİN STOK ALARMI: Ürün ÖNCEDEN STOKTA DEĞİLSE (`prev_stock == False`) VE ŞİMDİ STOĞA GİRDİYSE
-        if curr_stock and not prev_stock:
-            notify = True
-            alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
-
-        elif curr_stock and curr_price > 0:
-            # Hedef Fiyat Düşüşü
-            if target_price > 0 and curr_price <= target_price and prev_price > target_price:
-                notify = True
-                tag = " (♻️ İkinci El / Depo)" if is_used else ""
-                alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
+        for url, info in list(tracked_products.items()):
+            current_data = scrape_amazon(url)
             
-            # Normal Fiyat Düşüşü
-            elif curr_price < prev_price and prev_price > 0:
+            if not current_data:
+                logging.warning(f"Ürün verisi çekilemedi: {url}")
+                continue
+
+            prev_stock = info.get("in_stock", True)
+            prev_price = info.get("last_price", 0.0)
+            prev_coupon = info.get("has_coupon", False)
+            target_price = info.get("target_price", 0.0)
+
+            curr_stock = current_data["in_stock"]
+            curr_price = current_data["price"]
+            curr_coupon = current_data["has_coupon"]
+            is_used = current_data.get("is_used", False)
+
+            notify = False
+            alert_reason = ""
+
+            if curr_stock and not prev_stock:
                 notify = True
-                tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
-                alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+                alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
 
-        # Kupon / Fırsat Alarmı
-        if curr_stock and curr_coupon and not prev_coupon:
-            notify = True
-            coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>"
-            alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
+            elif curr_stock and curr_price > 0:
+                if target_price > 0 and curr_price <= target_price and prev_price > target_price:
+                    notify = True
+                    tag = " (♻️ İkinci El / Depo)" if is_used else ""
+                    alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
+                
+                elif curr_price < prev_price and prev_price > 0:
+                    notify = True
+                    tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
+                    alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
-        # Fiyat Geçmişi Güncelleme
-        history = info.get("history", [])
-        if curr_price > 0 and (not history or history[-1] != curr_price):
-            history.append(curr_price)
-            if len(history) > 5:
-                history.pop(0)
+            if curr_stock and curr_coupon and not prev_coupon:
+                notify = True
+                coupon_msg = "\n🎟 <b>KUPON / FIRSAT TESPİT EDİLDİ!</b>"
+                alert_reason = alert_reason + coupon_msg if alert_reason else coupon_msg
 
-        tracked_products[url]["in_stock"] = curr_stock
-        tracked_products[url]["last_price"] = curr_price
-        tracked_products[url]["has_coupon"] = curr_coupon
-        tracked_products[url]["last_check"] = now_tr
-        tracked_products[url]["history"] = history
-        updated = True
+            history = info.get("history", [])
+            if curr_price > 0 and (not history or history[-1] != curr_price):
+                history.append(curr_price)
+                if len(history) > 5:
+                    history.pop(0)
 
-        if notify:
-            msg = (
-                f"{alert_reason}\n\n"
-                f"📦 <b>{current_data['title']}</b>\n"
-                f"🕒 <b>Tarih:</b> {now_tr}\n"
-                f"🔗 <a href='{url}'>Ürüne Gitmek İçin Tıklayın</a>"
-            )
-            try:
-                await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML")
-            except Exception as e:
-                logging.error(f"Bildirim hatası: {e}")
+            tracked_products[url]["in_stock"] = curr_stock
+            tracked_products[url]["last_price"] = curr_price
+            tracked_products[url]["has_coupon"] = curr_coupon
+            tracked_products[url]["last_check"] = now_tr
+            tracked_products[url]["history"] = history
+            updated = True
 
-    if updated:
-        save_data(tracked_products)
+            if notify:
+                msg = (
+                    f"{alert_reason}\n\n"
+                    f"📦 <b>{current_data['title']}</b>\n"
+                    f"🕒 <b>Tarih:</b> {now_tr}\n"
+                    f"🔗 <a href='{url}'>Ürüne Gitmek İçin Tıklayın</a>"
+                )
+                try:
+                    await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML")
+                except Exception as e:
+                    logging.error(f"Bildirim hatası: {e}")
+
+        if updated:
+            save_data(tracked_products)
+    except Exception as e:
+        logging.error(f"Arka plan görevi hatası: {e}")
 
 # ================= ANA BAŞLATICI =================
 
@@ -519,7 +510,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("durum", status_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
-    app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
+    if app.job_queue:
+        app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
+    else:
+        logging.warning("JobQueue yüklenemedi! 'pip install python-telegram-bot[job-queue]' çalıştırın.")
 
     print("Bot başarıyla başlatıldı!")
     app.run_polling()
