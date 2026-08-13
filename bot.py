@@ -54,7 +54,7 @@ tracked_products = load_data()
 
 def get_tr_time() -> str:
     tr_tz = timezone(timedelta(hours=3))
-    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+    months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylul", "Ekim", "Kasım", "Aralık"]
     now = datetime.now(tr_tz)
     return f"{now.day} {months[now.month - 1]} {now.strftime('%H:%M')}"
 
@@ -74,20 +74,24 @@ def parse_price(price_str: str) -> float:
     if not price_str:
         return 0.0
     try:
+        # Metindeki sayısal olmayan (nokta ve virgül hariç) karakterleri temizle
         clean = re.sub(r"[^\d.,]", "", str(price_str)).strip()
         if not clean:
             return 0.0
 
+        # Binlik ve ondalık ayrım kontrolü (Türkiye formatı: 15.999,00 TL veya 15999,00)
         if "." in clean and "," in clean:
             clean = clean.replace(".", "").replace(",", ".")
         elif "," in clean:
             clean = clean.replace(",", ".")
         elif "." in clean:
             parts = clean.split(".")
+            # Eğer noktadan sonra 3 basamak varsa bu binlik ayracıdır (örn: 15.999)
             if len(parts[-1]) == 3:
                 clean = clean.replace(".", "")
 
-        return float(clean)
+        val = float(clean)
+        return val if val > 0.0 else 0.0
     except Exception:
         return 0.0
 
@@ -138,10 +142,18 @@ def scrape_amazon(raw_url: str):
         title = title_el.get_text(strip=True)
 
         found_prices = []
+        
+        # Genişletilmiş ve Kapsamlı Amazon Fiyat Seçicileri
         price_selectors = [
             "#corePrice_feature_div .a-price .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
             "#apex_desktop .a-price .a-offscreen",
+            "#price_inside_buybox",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+            "#priceblock_saleprice",
+            ".a-price .a-offscreen",
+            "span.a-price-whole",
             "#usedAccordion .a-price .a-offscreen",
             "#moreBuyingChoices_feature_div .a-price .a-offscreen"
         ]
@@ -150,10 +162,23 @@ def scrape_amazon(raw_url: str):
             elements = soup.select(sel)
             for el in elements:
                 p = parse_price(el.get_text())
-                if p > 500.0:
+                if p > 0.0:
+                    found_prices.append(p)
+
+        # Eğer özel seçiciler fiyat bulamazsa genel arama yap
+        if not found_prices:
+            all_price_tags = soup.find_all(class_=re.compile(r"a-price|priceBlock", re.I))
+            for tag in all_price_tags:
+                p = parse_price(tag.get_text())
+                if p > 0.0:
                     found_prices.append(p)
 
         extracted_price = min(found_prices) if found_prices else 0.0
+
+        # Stok Durumu Kontrolü (Fiyat varsa VEYA 'Sepete Ekle' / 'Şimdi Al' butonu varsa)
+        has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
+        
+        in_stock = (extracted_price > 0.0) or has_buy_button
 
         used_keywords = ["ikinci el", "kullanılmış", "fırsat ürünleri", "amazon warehouse", "used"]
         is_used = any(kw in html_text.lower() for kw in used_keywords)
@@ -164,8 +189,6 @@ def scrape_amazon(raw_url: str):
             if soup.select(c_sel):
                 has_coupon = True
                 break
-
-        in_stock = extracted_price > 0.0
 
         return {
             "title": title[:45] + "..." if len(title) > 45 else title,
@@ -406,7 +429,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
     for url, info in list(tracked_products.items()):
         current_data = scrape_amazon(url)
         
-        # BAĞLANTI / ENGEL HATASI: Tarama başarısızsa ürünün mevcut stok durumuna dokunma!
+        # BAĞLANTI / ENGEL HATASI: Tarama başarısızsa ürünün mevcut durumunu koru!
         if not current_data:
             logging.warning(f"Ürün verisi çekilemedi, eski durum korunuyor: {url}")
             continue
@@ -470,7 +493,6 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                 f"🔗 <a href='{url}'>Ürüne Gitmek İçin Tıklayın</a>"
             )
             try:
-                # Fotoğraf ve link önizlemesi açık olarak gönderilir
                 await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Bildirim hatası: {e}")
