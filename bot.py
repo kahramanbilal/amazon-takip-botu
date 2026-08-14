@@ -85,7 +85,7 @@ def resolve_url(url: str) -> str:
     try:
         s = requests.Session()
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
         })
         res = s.get(url, allow_redirects=True, timeout=12)
         return res.url
@@ -124,7 +124,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= KREDİ TASARRUFLU AMAZON SCRAPER =================
+# ================= AMAZON SCRAPER (1 KREDİ MODU) =================
 
 def extract_price_from_soup(soup) -> float:
     variation_selectors = [
@@ -178,32 +178,25 @@ def extract_price_from_soup(soup) -> float:
 def scrape_amazon(raw_url: str):
     try:
         real_url = resolve_url(raw_url)
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8"
-        }
-
         res = None
 
-        # 1. ÖNCELİK: Doğrudan Ücretsiz İstek (Kredi Harcamaz)
-        try:
+        # ScraperAPI ile proxy üzerinden çağrı (Sadece 1 kredi harcar)
+        if SCRAPER_KEY:
+            try:
+                target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
+                res = requests.get(target_url, timeout=20)
+            except Exception as e:
+                logging.error(f"ScraperAPI Baglanti Hatasi: {e}")
+
+        # ScraperAPI yoksa veya başarısızsa doğrudan istek at
+        if not res or res.status_code != 200 or "productTitle" not in res.text:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8"
+            }
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
-            res = session.get(real_url, headers=headers, timeout=10)
-        except Exception:
-            pass
-
-        # 2. ÖNCELİK: Yalnızca İlk İstek Başarısız Olursa ScraperAPI Kullan (Tek Kredilik Mod)
-        if not res or res.status_code != 200 or "productTitle" not in res.text:
-            if SCRAPER_KEY:
-                try:
-                    # render=true kaldırıldı: 5-10 kredi yerine sadece 1 kredi harcar
-                    target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
-                    res = requests.get(target_url, timeout=15)
-                except Exception:
-                    pass
+            res = session.get(real_url, headers=headers, timeout=12)
 
         if not res or res.status_code != 200:
             return None
@@ -569,7 +562,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
     if app.job_queue:
-        # 10 Dakika (600 saniye) sıklık aynen korundu!
         app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
     else:
         logging.warning("JobQueue yüklenemedi! 'pip install python-telegram-bot[job-queue]' çalıştırın.")
