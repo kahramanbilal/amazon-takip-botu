@@ -124,7 +124,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AMAZON SCRAPER (1 KREDİ MODU) =================
+# ================= AMAZON SCRAPER (SIRA KONTROLLÜ) =================
 
 def extract_price_from_soup(soup) -> float:
     variation_selectors = [
@@ -179,24 +179,41 @@ def scrape_amazon(raw_url: str):
     try:
         real_url = resolve_url(raw_url)
         res = None
+        
+        # 1. ADIM: Doğrudan Ücretsiz İstek (0 Kredi)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.google.com.tr/",
+            "DNT": "1"
+        }
 
-        # ScraperAPI ile proxy üzerinden çağrı (Sadece 1 kredi harcar)
-        if SCRAPER_KEY:
-            try:
-                target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
-                res = requests.get(target_url, timeout=20)
-            except Exception as e:
-                logging.error(f"ScraperAPI Baglanti Hatasi: {e}")
-
-        # ScraperAPI yoksa veya başarısızsa doğrudan istek at
-        if not res or res.status_code != 200 or "productTitle" not in res.text:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8"
-            }
+        try:
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
-            res = session.get(real_url, headers=headers, timeout=12)
+            session.cookies.set("lc-main-tr", "tr_TR", domain=".amazon.com.tr")
+            res = session.get(real_url, headers=headers, timeout=10)
+        except Exception as e:
+            logging.warning(f"Doğrudan bağlantı başarısız: {e}")
+
+        # Başarı Kontrolü (Sayfa tam yüklendi mi ve robot engeli var mı?)
+        is_success = (
+            res is not None 
+            and res.status_code == 200 
+            and "productTitle" in res.text 
+            and "enter the characters you see below" not in res.text.lower()
+            and "robot değilim" not in res.text.lower()
+        )
+
+        # 2. ADIM: Yalnızca İlk Adım Başarısız Olursa ScraperAPI (1 Kredi)
+        if not is_success and SCRAPER_KEY:
+            logging.info(f"Doğrudan istek engellendi, ScraperAPI kullanılıyor: {real_url}")
+            try:
+                target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
+                res = requests.get(target_url, timeout=15)
+            except Exception as e:
+                logging.error(f"ScraperAPI Bağlantı Hatası: {e}")
 
         if not res or res.status_code != 200:
             return None
@@ -562,6 +579,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
     if app.job_queue:
+        # 10 dakikalık zaman aralığı (600 saniye) korundu
         app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
     else:
         logging.warning("JobQueue yüklenemedi! 'pip install python-telegram-bot[job-queue]' çalıştırın.")
