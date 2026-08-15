@@ -1,12 +1,13 @@
 import os
 import re
 import json
+import random
 import logging
 import asyncio
 import requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -25,6 +26,13 @@ SCRAPER_KEY = os.environ.get("SCRAPER_KEY")
 NPOINT_ID = os.environ.get("NPOINT_ID")
 
 ALLOWED_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV and CHAT_ID_ENV.isdigit() else None
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+]
 
 # ================= KORUMALI BULUT VERİ TABANI YÖNETİMİ (NPOINT) =================
 
@@ -84,14 +92,13 @@ def get_tr_time() -> str:
 def resolve_url(url: str) -> str:
     try:
         s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-        })
+        s.headers.update({"User-Agent": random.choice(USER_AGENTS)})
         res = s.get(url, allow_redirects=True, timeout=12)
-        return res.url
+        final_url = res.url.split("?")[0].split("/ref=")[0]
+        return final_url
     except Exception as e:
         logging.error(f"URL Yönlendirme hatası: {e}")
-        return url
+        return url.split("?")[0].split("/ref=")[0]
 
 def parse_price(price_str: str) -> float:
     if not price_str:
@@ -124,7 +131,7 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AMAZON SCRAPER (SIRA KONTROLLÜ) =================
+# ================= AMAZON SCRAPER (SCRAPERAPI DESTEKLİ) =================
 
 def extract_price_from_soup(soup) -> float:
     variation_selectors = [
@@ -174,15 +181,37 @@ def extract_price_from_soup(soup) -> float:
 
     return 0.0
 
+def extract_image_url(soup) -> str:
+    try:
+        img_el = soup.find("img", {"id": "landingImage"}) or soup.find("img", {"id": "imgBlkFront"})
+        if img_el:
+            if img_el.has_attr("data-old-hires") and img_el["data-old-hires"]:
+                return img_el["data-old-hires"]
+            if img_el.has_attr("src"):
+                return img_el["src"]
+    except Exception:
+        pass
+    return ""
+
+def is_valid_html(html_text: str) -> bool:
+    """Sayfanın gerçek bir ürün sayfası mı yoksa engel/CAPTCHA mı olduğunu kontrol eder."""
+    if not html_text:
+        return False
+    
+    text_lower = html_text.lower()
+    if "enter the characters you see below" in text_lower or "robot değilim" in text_lower:
+        return False
+        
+    return "producttitle" in text_lower or "id=\"title\"" in text_lower
 
 def scrape_amazon(raw_url: str):
     try:
         real_url = resolve_url(raw_url)
-        res = None
+        html_content = None
         
-        # 1. ADIM: Doğrudan Ücretsiz İstek (0 Kredi)
+        # 1. ÖNCELİK: Ücretsiz Doğrudan İstek
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.google.com.tr/",
@@ -194,35 +223,35 @@ def scrape_amazon(raw_url: str):
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
             session.cookies.set("lc-main-tr", "tr_TR", domain=".amazon.com.tr")
             res = session.get(real_url, headers=headers, timeout=10)
+            if res.status_code == 200 and is_valid_html(res.text):
+                html_content = res.text
         except Exception as e:
-            logging.warning(f"Doğrudan bağlantı başarısız: {e}")
+            logging.warning(f"Doğrudan istek başarısız oldu: {e}")
 
-        # Başarı Kontrolü (Sayfa tam yüklendi mi ve robot engeli var mı?)
-        is_success = (
-            res is not None 
-            and res.status_code == 200 
-            and "productTitle" in res.text 
-            and "enter the characters you see below" not in res.text.lower()
-            and "robot değilim" not in res.text.lower()
-        )
-
-        # 2. ADIM: Yalnızca İlk Adım Başarısız Olursa ScraperAPI (1 Kredi)
-        if not is_success and SCRAPER_KEY:
-            logging.info(f"Doğrudan istek engellendi, ScraperAPI kullanılıyor: {real_url}")
+        # 2. ÖNCELİK: ScraperAPI (Doğrudan istek başarısızsa veya engellendiyse)
+        if not html_content and SCRAPER_KEY:
+            logging.info(f"Doğrudan istek engellendi, ScraperAPI devreye giriyor: {real_url}")
             try:
-                target_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(real_url)}&country_code=tr"
-                res = requests.get(target_url, timeout=15)
+                # ScraperAPI sorgu parametreleri
+                target_url = (
+                    f"http://api.scraperapi.com?"
+                    f"api_key={SCRAPER_KEY}"
+                    f"&url={requests.utils.quote(real_url)}"
+                    f"&country_code=tr"
+                    f"&device_type=desktop"
+                )
+                res = requests.get(target_url, timeout=25)
+                if res.status_code == 200 and is_valid_html(res.text):
+                    html_content = res.text
+                else:
+                    logging.error(f"ScraperAPI engeli aşamadı veya hatalı yanıt döndürdü (HTTP {res.status_code}).")
             except Exception as e:
                 logging.error(f"ScraperAPI Bağlantı Hatası: {e}")
 
-        if not res or res.status_code != 200:
+        if not html_content:
             return None
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        html_text = res.text
-
-        if "enter the characters you see below" in html_text.lower() or "robot değilim" in html_text.lower():
-            return None
+        soup = BeautifulSoup(html_content, "html.parser")
 
         title_el = soup.find("span", {"id": "productTitle"}) or soup.find("h1", {"id": "title"})
         if not title_el:
@@ -230,12 +259,13 @@ def scrape_amazon(raw_url: str):
         
         title = title_el.get_text(strip=True)
         extracted_price = extract_price_from_soup(soup)
+        image_url = extract_image_url(soup)
 
         has_buy_button = bool(soup.find("input", {"id": "add-to-cart-button"}) or soup.find("input", {"id": "buy-now-button"}))
         in_stock = (extracted_price > 0.0) or has_buy_button
 
         used_keywords = ["ikinci el", "kullanılmış", "fırsat ürünleri", "amazon warehouse", "used"]
-        is_used = any(kw in html_text.lower() for kw in used_keywords)
+        is_used = any(kw in html_content.lower() for kw in used_keywords)
 
         has_coupon = False
         coupon_selectors = ["#promoPriceBlockMessage_feature_div", "#vPCBadge", "#applicable_promotion_list", ".voucher-badge"]
@@ -250,6 +280,7 @@ def scrape_amazon(raw_url: str):
             "in_stock": in_stock,
             "is_used": is_used,
             "has_coupon": has_coupon,
+            "image_url": image_url,
             "real_url": real_url
         }
     except Exception as e:
@@ -268,14 +299,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     welcome_text = (
         "🤖 <b>Amazon Stok & Fiyat Takip Botu Pro!</b>\n\n"
-        "<b>Komutlar:</b>\n"
+        "<b>Temel Komutlar:</b>\n"
         "▫️ `/ekle [link] [hedef_fiyat]` - Takip ekler\n"
         "▫️ `/liste` - Takip edilen ürünleri gösterir\n"
         "▫️ `/fiyat [sıra_no]` - Canlı anlık fiyatı çeker\n"
-        "▫️ `/tara` - Anında tüm ürünleri tarar\n"
         "▫️ `/gecmis [sıra_no]` - Fiyat geçmişini gösterir\n"
-        "▫️ `/sil [sıra_no]` - Listeden ürün çıkarır\n"
-        "▫️ `/durum` - Sistem durumunu raporlar\n"
+        "▫️ `/tara` - Anında tüm ürünleri tarar\n"
+        "▫️ `/rapor` - Genel durum raporu sunar\n"
+        "▫️ `/sil [sıra_no]` - Listeden ürün çıkarır\n\n"
+        "<b>Temizleme Komutları:</b>\n"
+        "▫️ `/temizle_stoksuz` - Stokta olmayanları siler\n"
+        "▫️ `/temizle_hepsi` - Tüm listeyi sıfırlar\n"
     )
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
@@ -304,7 +338,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await asyncio.to_thread(scrape_amazon, url)
 
     if not data:
-        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Lütfen biraz sonra tekrar deneyin.")
+        await msg.edit_text("❌ Ürün bilgileri çekilemedi. Amazon engeline takılmış olabilir veya link geçersiz.")
         return
 
     real_url = data["real_url"]
@@ -315,8 +349,10 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": data["title"],
         "last_price": data["price"],
         "target_price": target_price,
+        "lowest_price": data["price"] if data["price"] > 0 else 999999.0,
         "in_stock": data["in_stock"],
         "has_coupon": data["has_coupon"],
+        "image_url": data.get("image_url", ""),
         "last_check": now_tr,
         "history": history
     }
@@ -329,10 +365,21 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 <b>Ürün Takibe Eklendi!</b>\n\n"
         f"📦 <b>Ürün:</b> {data['title']}\n"
         f"📊 <b>Durum:</b> {status_str}{target_str}\n"
-        f"🕒 <b>Tarama Zamanı:</b> {now_tr}\n"
-        f"🔗 <a href='{real_url}'>Ürüne Git</a>"
+        f"🕒 <b>Tarama Zamanı:</b> {now_tr}"
     )
-    await msg.edit_text(reply, parse_mode="HTML")
+    
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 FIRSATA GİT", url=real_url)]])
+    await msg.delete()
+
+    # Fotoğraf gönderme fallback mekanizması
+    if data.get("image_url"):
+        try:
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=data["image_url"], caption=reply, parse_mode="HTML", reply_markup=keyboard)
+            return
+        except Exception as e:
+            logging.warning(f"Resimli mesaj gönderilemedi, metin olarak gönderiliyor: {e}")
+
+    await update.message.reply_text(reply, parse_mode="HTML", reply_markup=keyboard)
 
 async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -393,6 +440,9 @@ async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked_products[target_url]["in_stock"] = current_data["in_stock"]
     tracked_products[target_url]["has_coupon"] = current_data["has_coupon"]
     tracked_products[target_url]["last_check"] = now_tr
+    if current_data.get("image_url"):
+        tracked_products[target_url]["image_url"] = current_data["image_url"]
+        
     await asyncio.to_thread(save_data, tracked_products)
 
     stok_str = f"✅ {current_data['price']:.2f} TL" if current_data["in_stock"] else "❌ Stokta Yok"
@@ -401,10 +451,19 @@ async def get_instant_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚡ <b>ANLIK FİYAT BİLGİSİ</b>\n\n"
         f"📦 <b>Ürün:</b> {current_data['title']}\n"
         f"💰 <b>Anlık Durum:</b> {stok_str}\n"
-        f"🕒 <b>Sorgu Tarihi (TSİ):</b> {now_tr}\n"
-        f"🔗 <a href='{target_url}'>Ürüne Git</a>"
+        f"🕒 <b>Sorgu Tarihi (TSİ):</b> {now_tr}"
     )
-    await msg.edit_text(res_text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 FIRSATA GİT", url=target_url)]])
+    await msg.delete()
+
+    if current_data.get("image_url"):
+        try:
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=current_data["image_url"], caption=res_text, parse_mode="HTML", reply_markup=keyboard)
+            return
+        except Exception:
+            pass
+
+    await update.message.reply_text(res_text, parse_mode="HTML", reply_markup=keyboard)
 
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -429,11 +488,44 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📉 Geçmiş kaydı yok.", parse_mode="HTML")
         return
 
-    hist_text = f"📈 <b>FİYAT GEÇMİŞİ</b>\n📦 <b>{product['title']}</b>\n\n"
-    for i, p in enumerate(reversed(history), 1):
-        hist_text += f"• Kayıt {i}: <b>{p:.2f} TL</b>\n"
+    hist_text = f"📈 <b>FİYAT GEÇMİŞİ & TREND</b>\n📦 <b>{product['title']}</b>\n\n"
+    
+    for i in range(len(history)):
+        curr = history[i]
+        icon = "➡️"
+        if i > 0:
+            prev = history[i-1]
+            if curr < prev:
+                icon = "📉 (Düştü)"
+            elif curr > prev:
+                icon = "↗️ (Yükseldi)"
+        
+        hist_text += f"• Kayıt {i+1}: <b>{curr:.2f} TL</b> {icon}\n"
 
     await update.message.reply_text(hist_text, parse_mode="HTML")
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+
+    total = len(tracked_products)
+    if total == 0:
+        await update.message.reply_text("📊 Takipte ürün bulunmuyor.")
+        return
+
+    in_stock_count = sum(1 for p in tracked_products.values() if p.get("in_stock"))
+    out_of_stock_count = total - in_stock_count
+    coupon_count = sum(1 for p in tracked_products.values() if p.get("has_coupon"))
+
+    report_text = (
+        f"📊 <b>GENEL BOTA BAKIŞ RAPORU</b>\n\n"
+        f"📦 Toplam Takip: <b>{total} Ürün</b>\n"
+        f"✅ Stokta Olanlar: <b>{in_stock_count} Ürün</b>\n"
+        f"❌ Stokta Olmayanlar: <b>{out_of_stock_count} Ürün</b>\n"
+        f"🎟 Kuponlu Ürünler: <b>{coupon_count} Ürün</b>\n"
+        f"🕒 Son Rapor Tarihi: {get_tr_time()}"
+    )
+    await update.message.reply_text(report_text, parse_mode="HTML")
 
 async def force_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -463,11 +555,31 @@ async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(save_data, tracked_products)
     await update.message.reply_text(f"🗑 <b>{removed_item['title']}</b> silindi.", parse_mode="HTML")
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_out_of_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    count = len(tracked_products)
-    await update.message.reply_text(f"⚡ Bot aktif! Toplam Takip Edilen Ürün: <b>{count}</b>", parse_mode="HTML")
+
+    global tracked_products
+    removed_count = 0
+    for url, info in list(tracked_products.items()):
+        if not info.get("in_stock"):
+            tracked_products.pop(url)
+            removed_count += 1
+
+    if removed_count > 0:
+        await asyncio.to_thread(save_data, tracked_products)
+        await update.message.reply_text(f"🗑 Stokta olmayan <b>{removed_count}</b> ürün silindi.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("📋 Stokta olmayan ürün bulunamadı.")
+
+async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+
+    global tracked_products
+    tracked_products.clear()
+    await asyncio.to_thread(save_data, tracked_products)
+    await update.message.reply_text("🗑 Tüm takip listesi temizlendi!")
 
 # ================= ARKA PLAN TARAMA GÖREVİ =================
 
@@ -495,11 +607,13 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             prev_price = info.get("last_price", 0.0)
             prev_coupon = info.get("has_coupon", False)
             target_price = info.get("target_price", 0.0)
+            lowest_price = info.get("lowest_price", 999999.0)
 
             curr_stock = current_data["in_stock"]
             curr_price = current_data["price"]
             curr_coupon = current_data["has_coupon"]
             is_used = current_data.get("is_used", False)
+            image_url = current_data.get("image_url") or info.get("image_url", "")
 
             notify = False
             alert_reason = ""
@@ -517,12 +631,17 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                 elif curr_price < prev_price and prev_price > 0:
                     drop_ratio = (prev_price - curr_price) / prev_price
                     if drop_ratio > 0.80 and curr_price < 1000.0:
-                        logging.warning(f"Aşırı fiyat sapması tespit edildi: {prev_price} -> {curr_price}")
                         notify = False
                     else:
                         notify = True
                         tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
-                        alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+                        
+                        ath_tag = ""
+                        if curr_price < lowest_price:
+                            ath_tag = "\n🔥 <b>TARİHİ EN DÜŞÜK FİYAT (ATH)!</b>"
+                            info["lowest_price"] = curr_price
+
+                        alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}{ath_tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
 
             if curr_stock and curr_coupon and not prev_coupon:
                 notify = True
@@ -532,7 +651,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             history = info.get("history", [])
             if curr_price > 0 and (not history or history[-1] != curr_price):
                 history.append(curr_price)
-                if len(history) > 5:
+                if len(history) > 10:
                     history.pop(0)
 
             tracked_products[url]["in_stock"] = curr_stock
@@ -540,19 +659,28 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             tracked_products[url]["has_coupon"] = curr_coupon
             tracked_products[url]["last_check"] = now_tr
             tracked_products[url]["history"] = history
+            tracked_products[url]["image_url"] = image_url
             updated = True
 
             if notify:
                 msg = (
                     f"{alert_reason}\n\n"
                     f"📦 <b>{current_data['title']}</b>\n"
-                    f"🕒 <b>Tarih:</b> {now_tr}\n"
-                    f"🔗 <a href='{url}'>Ürüne Gitmek İçin Tıklayın</a>"
+                    f"🕒 <b>Tarih:</b> {now_tr}"
                 )
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 FIRSATA GİT", url=url)]])
+                
                 try:
-                    await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML")
+                    if image_url:
+                        await context.bot.send_photo(chat_id=ALLOWED_CHAT_ID, photo=image_url, caption=msg, parse_mode="HTML", reply_markup=keyboard)
+                    else:
+                        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML", reply_markup=keyboard)
                 except Exception as e:
-                    logging.error(f"Bildirim hatası: {e}")
+                    logging.error(f"Fotoğraflı bildirim gönderilemedi, düz metin deneniyor: {e}")
+                    try:
+                        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML", reply_markup=keyboard)
+                    except Exception as err:
+                        logging.error(f"Bildirim tamamen başarısız oldu: {err}")
 
         if updated:
             await asyncio.to_thread(save_data, tracked_products)
@@ -573,16 +701,15 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("liste", list_products))
     app.add_handler(CommandHandler("fiyat", get_instant_price))
     app.add_handler(CommandHandler("gecmis", show_history))
+    app.add_handler(CommandHandler("rapor", report_command))
     app.add_handler(CommandHandler("tara", force_scan))
     app.add_handler(CommandHandler("sil", delete_product))
-    app.add_handler(CommandHandler("durum", status_command))
+    app.add_handler(CommandHandler("temizle_stoksuz", clear_out_of_stock))
+    app.add_handler(CommandHandler("temizle_hepsi", clear_all))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
     if app.job_queue:
-        # 10 dakikalık zaman aralığı (600 saniye) korundu
         app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
-    else:
-        logging.warning("JobQueue yüklenemedi! 'pip install python-telegram-bot[job-queue]' çalıştırın.")
 
     print("Bot başarıyla başlatıldı!")
     app.run_polling()
