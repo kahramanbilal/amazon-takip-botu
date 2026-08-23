@@ -709,7 +709,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
     if app.job_queue:
-        app.job_queue.run_repeating(check_all_products_job, interval=600, first=20)
+        app.job_queue.run_repeating(check_all_products_job, interval=300, first=20)
 
     print("Bot başarıyla başlatıldı!")
     app.run_polling()
