@@ -46,7 +46,7 @@ def load_data() -> dict:
     
     for attempt in range(3):
         try:
-            res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=15)
+            res = requests.get(f"https://api.npoint.io/{NPOINT_ID}", timeout=10)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, dict):
@@ -70,7 +70,7 @@ def save_data(data: dict):
 
     for attempt in range(3):
         try:
-            res = requests.post(f"https://api.npoint.io/{NPOINT_ID}", json=data, timeout=15)
+            res = requests.post(f"https://api.npoint.io/{NPOINT_ID}", json=data, timeout=10)
             if res.status_code == 200:
                 DATA_LOADED_SUCCESSFULLY = True
                 return
@@ -93,7 +93,7 @@ def resolve_url(url: str) -> str:
     try:
         s = requests.Session()
         s.headers.update({"User-Agent": random.choice(USER_AGENTS)})
-        res = s.get(url, allow_redirects=True, timeout=12)
+        res = s.get(url, allow_redirects=True, timeout=8)
         final_url = res.url.split("?")[0].split("/ref=")[0]
         return final_url
     except Exception as e:
@@ -131,25 +131,25 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AMAZON SCRAPER (SCRAPERAPI DESTEKLİ) =================
+# ================= AMAZON SCRAPER (GÜÇLENDİRİLMİŞ FİYAT SEÇİCİ) =================
 
 def extract_price_from_soup(soup) -> float:
+    # 1. Varyasyon ve gereksiz kutuları temizle
     variation_selectors = [
-        "#twister", 
-        "#variation_color_name", 
-        "#variation_size_name", 
-        "#variation_style_name", 
-        ".twister-plus-inline-twister", 
-        "#inline-twister-row-color_name"
+        "#twister", "#variation_color_name", "#variation_size_name", 
+        "#variation_style_name", ".twister-plus-inline-twister", "#inline-twister-row-color_name"
     ]
     for v_sel in variation_selectors:
         for match in soup.select(v_sel):
             match.decompose()
 
+    # 2. Modern Amazon Fiyat Konteynerleri (.a-price yapıları)
     price_containers = [
         "#corePrice_feature_div .a-price",
         "#corePriceDisplay_desktop_feature_div .a-price",
-        "#apex_desktop .a-price"
+        "#apex_desktop .a-price",
+        ".priceToPay",
+        "#corePrice_desktop .a-price"
     ]
 
     for container in price_containers:
@@ -164,17 +164,20 @@ def extract_price_from_soup(soup) -> float:
                     if p_val > 0.0:
                         return p_val
 
+    # 3. Alternatif Düz Metin ve Offscreen Seçiciler
     selectors = [
+        ".priceToPay .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
         "#apex_desktop .a-price .a-offscreen",
         "#price_inside_buybox",
-        "#priceblock_ourprice"
+        "#priceblock_ourprice",
+        "#priceblock_dealprice",
+        ".a-price-whole"
     ]
 
     for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
+        for el in soup.select(sel):
             p = parse_price(el.get_text())
             if p > 0.0:
                 return p
@@ -194,7 +197,6 @@ def extract_image_url(soup) -> str:
     return ""
 
 def is_valid_html(html_text: str) -> bool:
-    """Sayfanın gerçek bir ürün sayfası mı yoksa engel/CAPTCHA mı olduğunu kontrol eder."""
     if not html_text:
         return False
     
@@ -209,7 +211,7 @@ def scrape_amazon(raw_url: str):
         real_url = resolve_url(raw_url)
         html_content = None
         
-        # 1. ÖNCELİK: Ücretsiz Doğrudan İstek
+        # 1. ÖNCELİK: Ücretsiz Doğrudan İstek (Hızlandırılmış timeout=5s)
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -222,17 +224,16 @@ def scrape_amazon(raw_url: str):
             session = requests.Session()
             session.cookies.set("i18n-prefs", "TRY", domain=".amazon.com.tr")
             session.cookies.set("lc-main-tr", "tr_TR", domain=".amazon.com.tr")
-            res = session.get(real_url, headers=headers, timeout=10)
+            res = session.get(real_url, headers=headers, timeout=5)
             if res.status_code == 200 and is_valid_html(res.text):
                 html_content = res.text
         except Exception as e:
             logging.warning(f"Doğrudan istek başarısız oldu: {e}")
 
-        # 2. ÖNCELİK: ScraperAPI (Doğrudan istek başarısızsa veya engellendiyse)
+        # 2. ÖNCELİK: ScraperAPI (Doğrudan istek takıldıysa veya engellendiyse)
         if not html_content and SCRAPER_KEY:
             logging.info(f"Doğrudan istek engellendi, ScraperAPI devreye giriyor: {real_url}")
             try:
-                # ScraperAPI sorgu parametreleri
                 target_url = (
                     f"http://api.scraperapi.com?"
                     f"api_key={SCRAPER_KEY}"
@@ -240,7 +241,7 @@ def scrape_amazon(raw_url: str):
                     f"&country_code=tr"
                     f"&device_type=desktop"
                 )
-                res = requests.get(target_url, timeout=25)
+                res = requests.get(target_url, timeout=15)
                 if res.status_code == 200 and is_valid_html(res.text):
                     html_content = res.text
                 else:
@@ -371,7 +372,6 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 FIRSATA GİT", url=real_url)]])
     await msg.delete()
 
-    # Fotoğraf gönderme fallback mekanizması
     if data.get("image_url"):
         try:
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=data["image_url"], caption=reply, parse_mode="HTML", reply_markup=keyboard)
@@ -618,7 +618,8 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             notify = False
             alert_reason = ""
 
-            if curr_stock and not prev_stock:
+            # Yanlış 0.00 TL Stok Alarmlarını Engelleme Kontrolü
+            if curr_stock and not prev_stock and curr_price > 0:
                 notify = True
                 alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
 
@@ -708,6 +709,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("temizle_hepsi", clear_all))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
+    # Tarama aralığı: 1 dakika (60 saniye)
     if app.job_queue:
         app.job_queue.run_repeating(check_all_products_job, interval=60, first=20)
 
