@@ -131,10 +131,9 @@ def parse_price(price_str: str) -> float:
     except Exception:
         return 0.0
 
-# ================= AMAZON SCRAPER (GÜÇLENDİRİLMİŞ FİYAT SEÇİCİ) =================
+# ================= AMAZON SCRAPER =================
 
 def extract_price_from_soup(soup) -> float:
-    # 1. Varyasyon ve gereksiz kutuları temizle
     variation_selectors = [
         "#twister", "#variation_color_name", "#variation_size_name", 
         "#variation_style_name", ".twister-plus-inline-twister", "#inline-twister-row-color_name"
@@ -143,7 +142,6 @@ def extract_price_from_soup(soup) -> float:
         for match in soup.select(v_sel):
             match.decompose()
 
-    # 2. Modern Amazon Fiyat Konteynerleri (.a-price yapıları)
     price_containers = [
         "#corePrice_feature_div .a-price",
         "#corePriceDisplay_desktop_feature_div .a-price",
@@ -164,7 +162,6 @@ def extract_price_from_soup(soup) -> float:
                     if p_val > 0.0:
                         return p_val
 
-    # 3. Alternatif Düz Metin ve Offscreen Seçiciler
     selectors = [
         ".priceToPay .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
@@ -211,7 +208,6 @@ def scrape_amazon(raw_url: str):
         real_url = resolve_url(raw_url)
         html_content = None
         
-        # 1. ÖNCELİK: Ücretsiz Doğrudan İstek (Hızlandırılmış timeout=5s)
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -230,7 +226,6 @@ def scrape_amazon(raw_url: str):
         except Exception as e:
             logging.warning(f"Doğrudan istek başarısız oldu: {e}")
 
-        # 2. ÖNCELİK: ScraperAPI (Doğrudan istek takıldıysa veya engellendiyse)
         if not html_content and SCRAPER_KEY:
             logging.info(f"Doğrudan istek engellendi, ScraperAPI devreye giriyor: {real_url}")
             try:
@@ -244,8 +239,6 @@ def scrape_amazon(raw_url: str):
                 res = requests.get(target_url, timeout=15)
                 if res.status_code == 200 and is_valid_html(res.text):
                     html_content = res.text
-                else:
-                    logging.error(f"ScraperAPI engeli aşamadı veya hatalı yanıt döndürdü (HTTP {res.status_code}).")
             except Exception as e:
                 logging.error(f"ScraperAPI Bağlantı Hatası: {e}")
 
@@ -377,7 +370,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=data["image_url"], caption=reply, parse_mode="HTML", reply_markup=keyboard)
             return
         except Exception as e:
-            logging.warning(f"Resimli mesaj gönderilemedi, metin olarak gönderiliyor: {e}")
+            logging.warning(f"Resimli mesaj gönderilemedi: {e}")
 
     await update.message.reply_text(reply, parse_mode="HTML", reply_markup=keyboard)
 
@@ -618,7 +611,6 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
             notify = False
             alert_reason = ""
 
-            # Yanlış 0.00 TL Stok Alarmlarını Engelleme Kontrolü
             if curr_stock and not prev_stock and curr_price > 0:
                 notify = True
                 alert_reason = f"🚨 <b>STOK ALARMI!</b>\nÜrün tekrar stoğa girdi!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
@@ -630,10 +622,11 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                     alert_reason = f"🎯 <b>HEDEF FİYAT ALARMI!</b>{tag}\nİstediğiniz fiyata ulaşıldı!\n💰 Fiyat: <b>{curr_price:.2f} TL</b>"
                 
                 elif curr_price < prev_price and prev_price > 0:
-                    drop_ratio = (prev_price - curr_price) / prev_price
-                    if drop_ratio > 0.80 and curr_price < 1000.0:
-                        notify = False
-                    else:
+                    price_diff = prev_price - curr_price
+                    drop_ratio = price_diff / prev_price
+                    
+                    # 💡 EŞİK FİLTRESİ: Yalnızca fiyat düşüşü %5 veya daha fazla ise bildir!
+                    if drop_ratio >= 0.05:
                         notify = True
                         tag = "\n♻️ <i>(İkinci El / Depo)</i>" if is_used else ""
                         
@@ -643,6 +636,8 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                             info["lowest_price"] = curr_price
 
                         alert_reason = f"📉 <b>FİYAT DÜŞTÜ ALARMI!</b>{tag}{ath_tag}\nEski Fiyat: {prev_price:.2f} TL\nYeni Fiyat: <b>{curr_price:.2f} TL</b>"
+                    else:
+                        notify = False  # %5'in altındaki düşüşlerde bildirim atma, arkada sessizce güncelle
 
             if curr_stock and curr_coupon and not prev_coupon:
                 notify = True
@@ -677,7 +672,7 @@ async def check_all_products_job(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML", reply_markup=keyboard)
                 except Exception as e:
-                    logging.error(f"Fotoğraflı bildirim gönderilemedi, düz metin deneniyor: {e}")
+                    logging.error(f"Bildirim gönderilemedi: {e}")
                     try:
                         await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="HTML", reply_markup=keyboard)
                     except Exception as err:
@@ -709,9 +704,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("temizle_hepsi", clear_all))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), add_product))
 
-    # Tarama aralığı: 1 dakika (60 saniye)
+    # Tarama aralığı: 5 dakika (300 saniye)
     if app.job_queue:
-        app.job_queue.run_repeating(check_all_products_job, interval=60, first=20)
+        app.job_queue.run_repeating(check_all_products_job, interval=300, first=20)
 
     print("Bot başarıyla başlatıldı!")
     app.run_polling()
